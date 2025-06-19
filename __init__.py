@@ -32,7 +32,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "BracketEscaper": "Bracket Escaper",
     "RapidSchedulerSelector": "Scheduler Selector",
     "RapidSchedulerCombo": "Rapid Scheduler Combo",
-    "Ranbooru": "Danbooru,"
+    "Ranbooru": "Danbooru"
 }
 
 __all__ = NODE_CLASS_MAPPINGS

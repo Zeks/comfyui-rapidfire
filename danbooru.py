@@ -67,7 +67,6 @@ class Danbooru(Booru):
             return {'posts': []}
 
 
-BOORUS = ['danbooru']
 COLORED_BG = [
     'black_background', 'aqua_background', 'white_background',
     'colored_background', 'gray_background', 'blue_background',
@@ -94,18 +93,19 @@ class Ranbooru:
         self.last_prompt = ''
         self.file_url = ''
         self.image = None
+        self.last_rating = None
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "booru": (BOORUS, {"default": "danbooru"}),
                 "max_pages": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1, "display": "number"}),
                 "tags": ("STRING", {"multiline": False, "default": ""}),
                 "rating": (["All", "Safe", "Sensitive", "Questionable", "Explicit"], {"default": "All"}),
-                "change_color": (["Default", "Colored", "Limited Palette", "Monochrome"], {"default": "Default"}),
                 "use_last_prompt": ("BOOLEAN", {"default": False}),
-                "return_picture": ("BOOLEAN", {"default": False})
+                "return_picture": ("BOOLEAN", {"default": False}),
+                "alternate_ratings": ("BOOLEAN", {"default": False}),
+                "blacklisted_tags": ("STRING", {"multiline": True, "default": ""})
             }
         }
 
@@ -116,7 +116,7 @@ class Ranbooru:
     def IS_CHANGED(self, **kwargs):
         return float('nan')
 
-    def ranbooru(self, booru, max_pages, tags, rating, change_color, use_last_prompt, return_picture):
+    def ranbooru(self, max_pages, tags, rating, use_last_prompt, return_picture, alternate_ratings, blacklisted_tags):
         bad_tags = [
             'mixed-language_text', 'watermark', 'text', 'english_text', 'speech_bubble',
             'signature', 'artist_name', 'censored', 'bar_censor', 'translation',
@@ -132,7 +132,11 @@ class Ranbooru:
             'censored_nipples', 'page_number', 'scan', 'fake_magazine_cover', 'korean_commentary'
         ]
 
-        api_url = Danbooru() if booru == 'danbooru' else None
+        # Add blacklisted tags to the list of bad tags
+        if blacklisted_tags:
+            bad_tags.extend(blacklisted_tags.split(','))
+
+        api_url = Danbooru()
 
         if use_last_prompt and self.last_prompt != '':
             final_tags = self.last_prompt
@@ -143,22 +147,19 @@ class Ranbooru:
                 add_tags += f'&tags={tags.replace(",", "+")}'
 
             if rating != 'All':
-                add_tags += f'+rating:{RATINGS[booru][rating]}'
+                add_tags += f'+rating:{RATINGS["danbooru"][rating]}'
 
-            data = api_url.get_data(add_tags, max_pages) if api_url else {'posts': []}
-            random_post = random.choice(data['posts']) if data['posts'] else {'tags': 'bad_post_fix'}
+            data = api_url.get_data(add_tags, max_pages)
+
+            random_post = self._select_random_post(data['posts'], alternate_ratings)
 
             clean_tags = re.sub(r'[()]', '', random_post['tags'])
-            temp_tags = random.sample(clean_tags.split(), len(clean_tags.split()))
+            temp_tags = clean_tags.split()
 
-            if change_color == 'Colored':
-                temp_tags.extend(COLORED_BG)
-            elif change_color == 'Limited Palette':
-                temp_tags.append('(limited_palette:1.3)')
-            elif change_color == 'Monochrome':
-                temp_tags.extend(BW_BG)
+            # Remove tags containing any blacklisted word
+            filtered_tags = [tag for tag in temp_tags if not any(bad_word.strip() in tag for bad_word in bad_tags)]
 
-            final_tags = ','.join(tag for tag in temp_tags if tag not in bad_tags)
+            final_tags = ','.join(filtered_tags)
             self.last_prompt = final_tags
 
             if 'file_url' in random_post:
@@ -180,6 +181,32 @@ class Ranbooru:
         else:
             empty_image = Image.new('RGB', (1, 1), color=(0, 0, 0))
             return (final_tags, pil2tensor(empty_image),)
+
+    def _select_random_post(self, posts, alternate_ratings):
+        if not posts:
+            return {'tags': 'bad_post_fix'}
+
+        if not alternate_ratings or self.last_rating is None:
+            random_post = random.choice(posts)
+            self.last_rating = random_post.get('rating', None)
+            return random_post
+
+        opposite_rating = self._get_opposite_rating(self.last_rating)
+        for post in posts:
+            if post.get('rating') == opposite_rating:
+                self.last_rating = opposite_rating
+                return post
+
+        # If no opposite rating found, just pick a random one
+        random_post = random.choice(posts)
+        self.last_rating = random_post.get('rating', None)
+        return random_post
+
+    def _get_opposite_rating(self, current_rating):
+        ratings = list(RATINGS['danbooru'].values())
+        index = ratings.index(current_rating)
+        opposite_index = (index + 1) % len(ratings)
+        return ratings[opposite_index]
 
 
 NODE_CLASS_MAPPINGS = {
