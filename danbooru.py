@@ -101,6 +101,7 @@ class Ranbooru:
             "required": {
                 "max_pages": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1, "display": "number"}),
                 "tags": ("STRING", {"multiline": False, "default": ""}),
+                "replacement_tag": ("STRING", {"multiline": False, "default": ""}),  # New input
                 "rating": (["All", "Safe", "Sensitive", "Questionable", "Explicit"], {"default": "All"}),
                 "use_last_prompt": ("BOOLEAN", {"default": False}),
                 "return_picture": ("BOOLEAN", {"default": False}),
@@ -116,7 +117,7 @@ class Ranbooru:
     def IS_CHANGED(self, **kwargs):
         return float('nan')
 
-    def ranbooru(self, max_pages, tags, rating, use_last_prompt, return_picture, alternate_ratings, blacklisted_tags):
+    def ranbooru(self, max_pages, tags, replacement_tag, rating, use_last_prompt, return_picture, alternate_ratings, blacklisted_tags):
         bad_tags = [
             'mixed-language_text', 'watermark', 'text', 'english_text', 'speech_bubble',
             'signature', 'artist_name', 'censored', 'bar_censor', 'translation',
@@ -137,7 +138,7 @@ class Ranbooru:
             bad_tags.extend(blacklisted_tags.split(','))
 
         api_url = Danbooru()
-
+        final_tags = ""
         if use_last_prompt and self.last_prompt != '':
             final_tags = self.last_prompt
             img_url = self.file_url
@@ -166,6 +167,24 @@ class Ranbooru:
                 self.file_url = random_post['file_url']
                 print(f"Image URL: {self.file_url}")
 
+            # Process replacement_tag logic
+            if replacement_tag:
+                # 1. Clean the search tags (remove parentheses and split)
+                search_tags_cleaned = [re.sub(r'[()]', '', tag).strip() for tag in tags.split(',')]
+                
+                # 2. Split final_tags into a list for modification
+                final_tags_list = [tag.strip() for tag in final_tags.split(',')]
+                
+                # 3. Find the first occurrence of any search tag and replace it
+                for i, tag in enumerate(final_tags_list):
+                    if tag in search_tags_cleaned:
+                        final_tags_list[i] = replacement_tag
+                        break  # Replace only the first occurrence (remove if all should be replaced)
+                
+                # 4. Join back into a string
+                final_tags = ','.join(final_tags_list)
+                self.last_prompt = final_tags
+
         if return_picture:
             img_url = self.file_url if use_last_prompt else random_post.get('file_url')
             try:
@@ -180,7 +199,7 @@ class Ranbooru:
                 return (final_tags, pil2tensor(empty_image),)
         else:
             empty_image = Image.new('RGB', (1, 1), color=(0, 0, 0))
-            return (final_tags, pil2tensor(empty_image),)
+            return (final_tags, pil2tensor(empty_image),)    
 
     def _select_random_post(self, posts, alternate_ratings):
         if not posts:
@@ -207,7 +226,6 @@ class Ranbooru:
         index = ratings.index(current_rating)
         opposite_index = (index + 1) % len(ratings)
         return ratings[opposite_index]
-
 
 NODE_CLASS_MAPPINGS = {
     "Ranbooru": Ranbooru,

@@ -7,6 +7,7 @@ from .cached_checkpoint import CachedCheckpoint
 from .escapedfind import BracketEscaper
 from .girlselector import RandomCharacterSelector
 from .schedulerselector import *
+from .advancedksampler import *
 from .danbooru import Ranbooru
 
 
@@ -21,6 +22,7 @@ NODE_CLASS_MAPPINGS = {
     "RapidSchedulerSelector": RapidSchedulerSelector,
     "RapidSchedulerCombo": RapidSchedulerCombo,
     "Ranbooru": Ranbooru,
+    "TwoModelAdvancedKsampler": TwoModelAdvancedKsampler,
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
@@ -32,7 +34,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "BracketEscaper": "Bracket Escaper",
     "RapidSchedulerSelector": "Scheduler Selector",
     "RapidSchedulerCombo": "Rapid Scheduler Combo",
-    "Ranbooru": "Danbooru"
+    "Ranbooru": "Danbooru",
+    "TwoModelAdvancedKsampler": "TwoModelAdvancedKsampler"
 }
 
 __all__ = NODE_CLASS_MAPPINGS
