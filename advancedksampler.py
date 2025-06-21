@@ -16,6 +16,7 @@ import psutil
 
 from comfy_extras.nodes_align_your_steps import AlignYourStepsScheduler
 from comfy_extras.nodes_gits import GITSScheduler
+import comfy_extras.nodes_model_advanced
 
 # Get the absolute path of various directories
 my_dir = os.path.dirname(os.path.abspath(__file__))
@@ -55,6 +56,17 @@ class TwoModelAdvancedKsampler:
                 "model2": ("MODEL",),
                 "positive2": ("CONDITIONING",),
                 "negative2": ("CONDITIONING",),
+                "rescaled_steps": ("INT",{"default": 8, "min": 0, "max": 100},),
+                "rescale_multiplier": (
+                    "FLOAT",
+                    {
+                        "default": 0.7,
+                        "min": 0.0,
+                        "max": 1,
+                        "step": 0.05,
+                        "round": 0.01,
+                    },
+                ),
                 "total_steps_original": ("INT",{"default": 25, "min": 0, "max": 100},),
                 "total_steps_shift": ("INT",{"default": 0, "min": -50, "max": 100},),
                 "noise_seed": (
@@ -98,6 +110,7 @@ class TwoModelAdvancedKsampler:
     def sample(self, 
         model1, positive1, negative1,
         model2, positive2, negative2, 
+        rescaled_steps,  rescale_multiplier,
         total_steps_original, total_steps_shift,
         noise_seed,
         sampler_name, scheduler,
@@ -126,11 +139,41 @@ class TwoModelAdvancedKsampler:
         # First sampling pass
         print("\n=== Starting First Sampling Pass ===")
         print(f"Using Model1 from step {steps1_start} to {steps1_end}")
+        samples = []
+        if rescaled_steps > 0:
+            CFGR = comfy_extras.nodes_model_advanced.RescaleCFG()
+            patched_model = CFGR.patch(model1, rescale_multiplier)[0]
+            print("Attepmpting rescaled CFG pass")
+            try:
+                samples = KSamplerAdvanced().sample(
+                    patched_model, 
+                    "enable",  # add_noise
+                    noise_seed, 
+                    total_steps_original, 
+                    starting_cfg, 
+                    sampler_name, 
+                    scheduler,
+                    positive1, 
+                    negative1, 
+                    latent_image, 
+                    steps1_start, 
+                    rescaled_steps,
+                    "enable"  # return_with_leftover_noise
+                )
+                print("Rescaled CFG pass completed successfully")
+                print(f"Output latent shape: {samples[0]['samples'].shape}")
+            except Exception as e:
+                print(f"\n!!! ERROR in first sampling pass !!!")
+                print(f"Error type: {type(e).__name__}")
+                print(f"Error message: {str(e)}")
+                raise e        
+        
         
         try:
+            actual_steps = (steps1_start + rescaled_steps) if rescaled_steps > 0 else steps1_start
             samples = KSamplerAdvanced().sample(
                 model1, 
-                "enable",  # add_noise
+                "disable",  # add_noise
                 noise_seed, 
                 total_steps_original, 
                 starting_cfg, 
@@ -138,8 +181,8 @@ class TwoModelAdvancedKsampler:
                 scheduler,
                 positive1, 
                 negative1, 
-                latent_image, 
-                steps1_start, 
+                samples[0], 
+                actual_steps, 
                 steps1_end,
                 "enable"  # return_with_leftover_noise
             )
