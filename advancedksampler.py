@@ -1,4 +1,3 @@
-
 from torch import Tensor
 from PIL import Image, ImageOps, ImageDraw, ImageFont
 from PIL.PngImagePlugin import PngInfo
@@ -171,7 +170,6 @@ class AdvancedCLIPTextEncodeWithBreak:
         return out
 
 
-
 class MultiModelAdvancedKsampler:
     @classmethod 
     def INPUT_TYPES(s):
@@ -201,10 +199,14 @@ class MultiModelAdvancedKsampler:
                 "token_normalization": (["none", "mean", "length", "length+mean"],),
                 "weight_interpretation": (["comfy", "A1111", "compel", "comfy++" ,"down_weight"],),
                 "latent_image": ("LATENT",),
+            },
+            "optional": {
+                "load_settings": ("STRING", {"multiline": True, "default": ""}),
             }
         }
 
-    RETURN_TYPES = ("LATENT",)
+    RETURN_TYPES = ("LATENT", "STRING")
+    RETURN_NAMES = ("LATENT", "settings")
     FUNCTION = "sample"
     CATEGORY = "sampling"
     
@@ -212,6 +214,70 @@ class MultiModelAdvancedKsampler:
         self.loaded_checkpoints = {}  # Dictionary to store loaded checkpoints by name
         self.current_checkpoints = set()  # Track currently requested checkpoints
         
+    def serialize_settings(self, **kwargs):
+        """Serialize all input parameters into a human-readable string"""
+        used_model_count = kwargs.get("used_model_count", 2)
+        
+        settings = {
+            "used_model_count": used_model_count,
+            "ckpt_name1": kwargs.get("ckpt_name1", ""),
+            # Only include ckpt_name2 if used_model_count >= 2
+            **({"ckpt_name2": kwargs.get("ckpt_name2", "")} if used_model_count >= 2 else {}),
+            # Only include ckpt_name3 if used_model_count >= 3
+            **({"ckpt_name3": kwargs.get("ckpt_name3", "")} if used_model_count >= 3 else {}),
+            "positive": kwargs.get("positive", ""),
+            "negative": kwargs.get("negative", ""),
+            "lora_name": kwargs.get("lora_name", ""),
+            "noise_seed": kwargs.get("noise_seed", 0),
+            "rescaled_steps": kwargs.get("rescaled_steps", 8),
+            "rescale_multiplier": kwargs.get("rescale_multiplier", 0.7),
+            "total_steps_original": kwargs.get("total_steps_original", 25),
+            # Only include second model steps if used_model_count >= 2
+            **({"total_steps_shift_second": kwargs.get("total_steps_shift_second", 0)} if used_model_count >= 2 else {}),
+            # Only include third model steps if used_model_count >= 3
+            **({"total_steps_shift_third": kwargs.get("total_steps_shift_third", 0)} if used_model_count >= 3 else {}),
+            "sampler_name": kwargs.get("sampler_name", "euler"),
+            "scheduler": kwargs.get("scheduler", "normal"),
+            "starting_cfg": kwargs.get("starting_cfg", 8.0),
+            "cfg_shift": kwargs.get("cfg_shift", 0.0),
+            "steps_end_first": kwargs.get("steps_end_first", 15),
+            # Only include second model steps if used_model_count >= 2
+            **({"steps_shift_second": kwargs.get("steps_shift_second", 0)} if used_model_count >= 2 else {}),
+            **({"steps_end_second": kwargs.get("steps_end_second", 0)} if used_model_count >= 2 else {}),
+            # Only include third model steps if used_model_count >= 3
+            **({"steps_shift_third": kwargs.get("steps_shift_third", 0)} if used_model_count >= 3 else {}),
+            "token_normalization": kwargs.get("token_normalization", "none"),
+            "weight_interpretation": kwargs.get("weight_interpretation", "comfy"),
+        }
+        
+        return json.dumps(settings, indent=2)
+    
+    def deserialize_settings(self, settings_str):
+        """Deserialize settings string back to a dictionary"""
+        if not settings_str.strip():
+            return None
+        
+        try:
+            return json.loads(settings_str)
+        except json.JSONDecodeError as e:
+            print(f"Error decoding settings: {e}")
+            return None
+    
+    def get_effective_settings(self, **kwargs):
+        """Get the effective settings, either from load_settings or direct inputs"""
+        load_settings = kwargs.get("load_settings", "")
+        
+        if load_settings and load_settings.strip():
+            loaded = self.deserialize_settings(load_settings)
+            if loaded:
+                # Create a new kwargs with loaded settings, but keep original latent_image
+                effective_kwargs = loaded.copy()
+                effective_kwargs["latent_image"] = kwargs["latent_image"]
+                return effective_kwargs
+        
+        # If no valid settings to load, use direct inputs
+        return kwargs
+    
     def purge_unused_checkpoints(self, requested_checkpoints):
         """Purges checkpoints that aren't in the current request"""
         # Convert to set for faster lookups
@@ -269,22 +335,75 @@ class MultiModelAdvancedKsampler:
             'negative_conditioning': negative_conditioning[0]
         }
 
-    def sample(self, used_model_count, ckpt_name1, ckpt_name2, ckpt_name3,
-              positive, negative, lora_name,noise_seed,
-              rescaled_steps, rescale_multiplier,
-              total_steps_original, total_steps_shift_second, total_steps_shift_third,
-              sampler_name, scheduler,
-              starting_cfg, cfg_shift,
-              steps_end_first,
-              steps_shift_second,steps_end_second,
-              steps_shift_third,
-              token_normalization, weight_interpretation,
-              latent_image, **kwargs):
+    def sample(self, **kwargs):
+        # Get effective settings (either from load_settings or direct inputs)
+        effective_kwargs = self.get_effective_settings(**kwargs)
+        load_settings = kwargs.get("load_settings", "")
+        
+        # Initialize UI update dictionary
+        ui_updates = {}
+        
+        # If we loaded settings from the string, populate ui_updates
+        if load_settings and load_settings.strip():
+            loaded_settings = self.deserialize_settings(load_settings)
+            if loaded_settings:
+                ui_updates = {
+                    "used_model_count": (loaded_settings["used_model_count"],),
+                    "ckpt_name1": (loaded_settings["ckpt_name1"],),
+                    "ckpt_name2": (loaded_settings["ckpt_name2"],),
+                    "ckpt_name3": (loaded_settings["ckpt_name3"],),
+                    "positive": (loaded_settings["positive"],),
+                    "negative": (loaded_settings["negative"],),
+                    "lora_name": (loaded_settings["lora_name"],),
+                    "noise_seed": (loaded_settings["noise_seed"],),
+                    "rescaled_steps": (loaded_settings["rescaled_steps"],),
+                    "rescale_multiplier": (loaded_settings["rescale_multiplier"],),
+                    "total_steps_original": (loaded_settings["total_steps_original"],),
+                    "total_steps_shift_second": (loaded_settings["total_steps_shift_second"],),
+                    "total_steps_shift_third": (loaded_settings["total_steps_shift_third"],),
+                    "sampler_name": (loaded_settings["sampler_name"],),
+                    "scheduler": (loaded_settings["scheduler"],),
+                    "starting_cfg": (loaded_settings["starting_cfg"],),
+                    "cfg_shift": (loaded_settings["cfg_shift"],),
+                    "steps_end_first": (loaded_settings["steps_end_first"],),
+                    "steps_shift_second": (loaded_settings["steps_shift_second"],),
+                    "steps_end_second": (loaded_settings["steps_end_second"],),
+                    "steps_shift_third": (loaded_settings["steps_shift_third"],),
+                    "token_normalization": (loaded_settings["token_normalization"],),
+                    "weight_interpretation": (loaded_settings["weight_interpretation"],),
+                }
+        
+        # Extract all parameters from effective_kwargs
+        used_model_count = effective_kwargs["used_model_count"]
+        ckpt_name1 = effective_kwargs["ckpt_name1"]
+        ckpt_name2 = effective_kwargs["ckpt_name2"]
+        ckpt_name3 = effective_kwargs["ckpt_name3"]
+        positive = effective_kwargs["positive"]
+        negative = effective_kwargs["negative"]
+        lora_name = effective_kwargs["lora_name"]
+        noise_seed = effective_kwargs["noise_seed"]
+        rescaled_steps = effective_kwargs["rescaled_steps"]
+        rescale_multiplier = effective_kwargs["rescale_multiplier"]
+        total_steps_original = effective_kwargs["total_steps_original"]
+        total_steps_shift_second = effective_kwargs["total_steps_shift_second"]
+        total_steps_shift_third = effective_kwargs["total_steps_shift_third"]
+        sampler_name = effective_kwargs["sampler_name"]
+        scheduler = effective_kwargs["scheduler"]
+        starting_cfg = effective_kwargs["starting_cfg"]
+        cfg_shift = effective_kwargs["cfg_shift"]
+        steps_end_first = effective_kwargs["steps_end_first"]
+        steps_shift_second = effective_kwargs["steps_shift_second"]
+        steps_end_second = effective_kwargs["steps_end_second"]
+        steps_shift_third = effective_kwargs["steps_shift_third"]
+        token_normalization = effective_kwargs["token_normalization"]
+        weight_interpretation = effective_kwargs["weight_interpretation"]
+        latent_image = effective_kwargs["latent_image"]
         
         # Determine which checkpoints are being requested
         requested_checkpoints = [ckpt_name1]
         if used_model_count >= 2:
             requested_checkpoints.append(ckpt_name2)
+            
         if used_model_count >= 3:
             requested_checkpoints.append(ckpt_name3)
         
@@ -295,11 +414,14 @@ class MultiModelAdvancedKsampler:
         pipelines = []
         pipelines.append(self.load_model_pipeline(ckpt_name1, lora_name, positive, negative,
                                                token_normalization, weight_interpretation))
+        if comfy.model_management.processing_interrupted():
+            return []
         
         if used_model_count >= 2:
             pipelines.append(self.load_model_pipeline(ckpt_name2, lora_name, positive, negative,
                                                     token_normalization, weight_interpretation))
-        
+        if comfy.model_management.processing_interrupted():
+            return []
         if used_model_count >= 3:
             pipelines.append(self.load_model_pipeline(ckpt_name3, lora_name, positive, negative,
                                                     token_normalization, weight_interpretation))
@@ -331,8 +453,10 @@ class MultiModelAdvancedKsampler:
             except Exception as e:
                 print(f"Error in rescaled CFG pass: {str(e)}")
                 raise e
-        if comfy.model_management.interrupted:
-            raise Exception("Execution stopped by user")
+        
+        if comfy.model_management.processing_interrupted():
+            return []
+        
         # First model's main pass
         try:
             actual_steps = rescaled_steps if rescaled_steps > 0 else 0
@@ -355,8 +479,10 @@ class MultiModelAdvancedKsampler:
         except Exception as e:
             print(f"Error in first model pass: {str(e)}")
             raise e
-        if comfy.model_management.interrupted:
-            raise Exception("Execution stopped by user")
+        
+        if comfy.model_management.processing_interrupted():
+            return []
+        
         # Second model pass if enabled
         if used_model_count >= 2:
             try:
@@ -384,8 +510,10 @@ class MultiModelAdvancedKsampler:
             except Exception as e:
                 print(f"Error in second model pass: {str(e)}")
                 raise e
-        if comfy.model_management.interrupted:
-            raise Exception("Execution stopped by user")
+        
+        if comfy.model_management.processing_interrupted():
+            return []
+        
         # Third model pass if enabled
         if used_model_count >= 3:
             try:
@@ -413,4 +541,11 @@ class MultiModelAdvancedKsampler:
                 print(f"Error in third model pass: {str(e)}")
                 raise e
 
-        return samples
+        # Serialize the settings used for this run
+        settings_str = self.serialize_settings(**effective_kwargs)
+        
+        # Return both the result and UI updates
+        return {
+            "ui": ui_updates,
+            "result": (samples[0], settings_str),
+        }
