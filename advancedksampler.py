@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 import folder_paths
+import comfy.model_management
 
 import ast
 from pathlib import Path
@@ -21,6 +22,7 @@ import re
 import nodes as native
 from .adv_encode import advanced_encode #, advanced_encode_XL
 
+import comfy.sd
 from comfy_extras.nodes_align_your_steps import AlignYourStepsScheduler
 from comfy_extras.nodes_gits import GITSScheduler
 import comfy_extras.nodes_model_advanced
@@ -170,60 +172,32 @@ class AdvancedCLIPTextEncodeWithBreak:
 
 
 
-class TwoModelAdvancedKsampler:
+class MultiModelAdvancedKsampler:
     @classmethod 
     def INPUT_TYPES(s):
         return {
             "required": { 
-                "model1": ("MODEL",),
-                "clip1": ("CLIP", ),
-                "model2": ("MODEL",),
-                "clip2": ("CLIP", ),
-                "positive": ("STRING",),
-                "negative": ("STRING",),
-                "lora_name": ("STRING",),
-                "rescaled_steps": ("INT",{"default": 8, "min": 0, "max": 100},),
-                "rescale_multiplier": (
-                    "FLOAT",
-                    {
-                        "default": 0.7,
-                        "min": 0.0,
-                        "max": 1,
-                        "step": 0.05,
-                        "round": 0.01,
-                    },
-                ),
-                "total_steps_original": ("INT",{"default": 25, "min": 0, "max": 100},),
-                "total_steps_shift": ("INT",{"default": 0, "min": -50, "max": 100},),
-                "noise_seed": (
-                    "INT",
-                    {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF},
-                ),
+                "used_model_count": ("INT",{"default": 2, "min": 1, "max": 3},),
+                "ckpt_name1": (folder_paths.get_filename_list("checkpoints"),),
+                "ckpt_name2": (folder_paths.get_filename_list("checkpoints"),),
+                "ckpt_name3": (folder_paths.get_filename_list("checkpoints"),),
+                "positive": ("STRING", {"multiline": False}),
+                "negative": ("STRING", {"multiline": False}),
+                "lora_name": ("STRING", {"default": ""}),
+                "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+                "rescaled_steps": ("INT",{"default": 8, "min": 0, "max": 100}),
+                "rescale_multiplier": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1, "step": 0.05}),
+                "total_steps_original": ("INT",{"default": 25, "min": 1, "max": 100}),
+                "total_steps_shift_second": ("INT",{"default": 0, "min": -50, "max": 100}),
+                "total_steps_shift_third": ("INT",{"default": 0, "min": -50, "max": 100}),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
                 "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
-                "starting_cfg": (
-                    "FLOAT",
-                    {
-                        "default": 8.0,
-                        "min": 0.0,
-                        "max": 100.0,
-                        "step": 0.1,
-                        "round": 0.01,
-                    },
-                ),
-                "cfg_shift": (
-                    "FLOAT",
-                    {
-                        "default": 0.0,
-                        "min": -10.0,
-                        "max": 100.0,
-                        "step": 0.1,
-                        "round": 0.01,
-                    },
-                ),
-                "steps1_start": ("INT", {"default": 0, "min": 0, "max": 100}),
-                "steps1_end": ("INT", {"default": 0, "min": 0, "max": 100}),
-                "start_steps2_shift": ("INT", {"default": 0, "min": -20, "max": 100}),
+                "starting_cfg": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+                "cfg_shift": ("FLOAT", {"default": 0.0, "min": -10.0, "max": 100.0, "step": 0.1}),
+                "steps_end_first": ("INT", {"default": 15, "min": 0, "max": 100}),
+                "steps_shift_second": ("INT", {"default": 0, "min": -20, "max": 100}),
+                "steps_end_second": ("INT", {"default": 0, "min": 0, "max": 100}),
+                "steps_shift_third": ("INT", {"default": 0, "min": -20, "max": 100}),
                 "token_normalization": (["none", "mean", "length", "length+mean"],),
                 "weight_interpretation": (["comfy", "A1111", "compel", "comfy++" ,"down_weight"],),
                 "latent_image": ("LATENT",),
@@ -231,55 +205,113 @@ class TwoModelAdvancedKsampler:
         }
 
     RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("LATENT",)
     FUNCTION = "sample"
     CATEGORY = "sampling"
+    
+    def __init__(self):
+        self.loaded_checkpoints = {}  # Dictionary to store loaded checkpoints by name
+        self.current_checkpoints = set()  # Track currently requested checkpoints
+        
+    def purge_unused_checkpoints(self, requested_checkpoints):
+        """Purges checkpoints that aren't in the current request"""
+        # Convert to set for faster lookups
+        requested_set = set(requested_checkpoints)
+        
+        # Find checkpoints to remove
+        to_remove = [name for name in self.loaded_checkpoints 
+                    if name not in requested_set]
+        
+        # Purge unused checkpoints
+        for name in to_remove:
+            print(f"Purging unused checkpoint: {name}")
+            del self.loaded_checkpoints[name]
+        
+        # Update current checkpoints
+        self.current_checkpoints = requested_set
 
-    def sample(self, 
-        model1, clip1, 
-        model2, clip2,
-        positive, negative, lora_name,
-        rescaled_steps,  rescale_multiplier,
-        total_steps_original, total_steps_shift,
-        noise_seed,
-        sampler_name, scheduler,
-        starting_cfg, cfg_shift,
-        steps1_start, steps1_end, start_steps2_shift,
-        token_normalization,weight_interpretation,
-        latent_image,
-        **kwargs):
-            
-        model1, clip1, text1 = LoraTagLoader().load_lora(model1, clip1, lora_name)
-        model2, clip2, text2 = LoraTagLoader().load_lora(model2, clip2, lora_name)
+    def load_model_pipeline(self, ckpt_name, lora_name, positive, negative,
+                          token_normalization, weight_interpretation):
+        """Helper function to load a complete model pipeline"""
+        # Check if we already have this checkpoint loaded
+        if ckpt_name in self.loaded_checkpoints:
+            model, clip, vae = self.loaded_checkpoints[ckpt_name]
+            print(f"Using cached checkpoint: {ckpt_name}")
+        else:
+            # Load base checkpoint if not found in cache
+            print(f"Loading new checkpoint: {ckpt_name}")
+            out = comfy.sd.load_checkpoint_guess_config(
+                folder_paths.get_full_path("checkpoints", ckpt_name),
+                output_vae=True,
+                output_clip=True,
+                embedding_directory=folder_paths.get_folder_paths("embeddings")
+            )
+            model, clip, vae = out[0], out[1], out[2]
+            self.loaded_checkpoints[ckpt_name] = (model, clip, vae)
         
-        positive_conditioning1 = AdvancedCLIPTextEncodeWithBreak().encode(clip1, positive, token_normalization, weight_interpretation)
-        positive_conditioning2 = AdvancedCLIPTextEncodeWithBreak().encode(clip2, positive, token_normalization, weight_interpretation)
-        negative_conditioning1 = AdvancedCLIPTextEncodeWithBreak().encode(clip1, negative, token_normalization, weight_interpretation)
-        negative_conditioning2 = AdvancedCLIPTextEncodeWithBreak().encode(clip2, negative, token_normalization, weight_interpretation)
+        # Apply LoRA if specified
+        if lora_name and lora_name.strip():
+            model, clip, _ = LoraTagLoader().load_lora(model, clip, lora_name)
         
-        # Debug print all input parameters
-        print("\n=== TwoModelAdvancedKsampler Debug Information ===")
-        print(f"Model1: {type(model1)}")
-        print(f"Model2: {type(model2)}")
+        # Generate conditioning
+        positive_conditioning = AdvancedCLIPTextEncodeWithBreak().encode(
+            clip, positive, token_normalization, weight_interpretation
+        )
+        
+        negative_conditioning = AdvancedCLIPTextEncodeWithBreak().encode(
+            clip, negative, token_normalization, weight_interpretation
+        )
+        
+        return {
+            'model': model,
+            'clip': clip,
+            'vae': vae,
+            'positive_conditioning': positive_conditioning[0],
+            'negative_conditioning': negative_conditioning[0]
+        }
 
-        print(f"Total Steps Original: {total_steps_original}")
-        print(f"Total Steps Shift: {total_steps_shift} (New total: {total_steps_original + total_steps_shift})")
-        print(f"Noise Seed: {noise_seed}")
-        print(f"Sampler: {sampler_name}, Scheduler: {scheduler}")
-        print(f"Starting CFG: {starting_cfg}, CFG Shift: {cfg_shift} (New CFG: {starting_cfg + cfg_shift})")
-        print(f"Model1 Steps Range: {steps1_start} to {steps1_end}")
-        print(f"Model2 Start Step Shift: {start_steps2_shift} (Absolute start step: {steps1_end + start_steps2_shift})")
-        print(f"Latent Image Shape: {latent_image['samples'].shape}")
+    def sample(self, used_model_count, ckpt_name1, ckpt_name2, ckpt_name3,
+              positive, negative, lora_name,noise_seed,
+              rescaled_steps, rescale_multiplier,
+              total_steps_original, total_steps_shift_second, total_steps_shift_third,
+              sampler_name, scheduler,
+              starting_cfg, cfg_shift,
+              steps_end_first,
+              steps_shift_second,steps_end_second,
+              steps_shift_third,
+              token_normalization, weight_interpretation,
+              latent_image, **kwargs):
         
+        # Determine which checkpoints are being requested
+        requested_checkpoints = [ckpt_name1]
+        if used_model_count >= 2:
+            requested_checkpoints.append(ckpt_name2)
+        if used_model_count >= 3:
+            requested_checkpoints.append(ckpt_name3)
+        
+        # Purge checkpoints that aren't being used this run
+        self.purge_unused_checkpoints(requested_checkpoints)
+        
+        # Load all required pipelines
+        pipelines = []
+        pipelines.append(self.load_model_pipeline(ckpt_name1, lora_name, positive, negative,
+                                               token_normalization, weight_interpretation))
+        
+        if used_model_count >= 2:
+            pipelines.append(self.load_model_pipeline(ckpt_name2, lora_name, positive, negative,
+                                                    token_normalization, weight_interpretation))
+        
+        if used_model_count >= 3:
+            pipelines.append(self.load_model_pipeline(ckpt_name3, lora_name, positive, negative,
+                                                    token_normalization, weight_interpretation))
+
         # First sampling pass
-        print("\n=== Starting First Sampling Pass ===")
-        print(f"Using Model1 from step {steps1_start} to {steps1_end}")
         samples = []
         if rescaled_steps > 0:
-            CFGR = comfy_extras.nodes_model_advanced.RescaleCFG()
-            patched_model = CFGR.patch(model1, rescale_multiplier)[0]
-            print("Attepmpting rescaled CFG pass")
             try:
+                CFGR = comfy_extras.nodes_model_advanced.RescaleCFG()
+                patched_model = CFGR.patch(pipelines[0]['model'], rescale_multiplier)[0]
+                print("Attempting rescaled CFG pass")
+                
                 samples = KSamplerAdvanced().sample(
                     patched_model, 
                     "enable",  # add_noise
@@ -288,81 +320,97 @@ class TwoModelAdvancedKsampler:
                     starting_cfg, 
                     sampler_name, 
                     scheduler,
-                    positive_conditioning1[0], 
-                    negative_conditioning1[0], 
+                    pipelines[0]['positive_conditioning'], 
+                    pipelines[0]['negative_conditioning'], 
                     latent_image, 
-                    steps1_start, 
+                    0, 
                     rescaled_steps,
                     "enable"  # return_with_leftover_noise
                 )
-                print("Rescaled CFG pass completed successfully")
-                print(f"Output latent shape: {samples[0]['samples'].shape}")
+                print(f"Rescaled CFG pass completed, latent shape: {samples[0]['samples'].shape}")
             except Exception as e:
-                print(f"\n!!! ERROR in first sampling pass !!!")
-                print(f"Error type: {type(e).__name__}")
-                print(f"Error message: {str(e)}")
-                raise e        
-        
-        
+                print(f"Error in rescaled CFG pass: {str(e)}")
+                raise e
+        if comfy.model_management.interrupted:
+            raise Exception("Execution stopped by user")
+        # First model's main pass
         try:
-            actual_steps = (steps1_start + rescaled_steps) if rescaled_steps > 0 else steps1_start
+            actual_steps = rescaled_steps if rescaled_steps > 0 else 0
             samples = KSamplerAdvanced().sample(
-                model1, 
-                "disable",  # add_noise
-                noise_seed, 
-                total_steps_original, 
-                starting_cfg, 
-                sampler_name, 
+                pipelines[0]['model'],
+                "disable" if rescaled_steps > 0 else "enable",  # add_noise
+                noise_seed,
+                total_steps_original,
+                starting_cfg,
+                sampler_name,
                 scheduler,
-                positive_conditioning1[0], 
-                negative_conditioning1[0], 
-                samples[0], 
-                actual_steps, 
-                steps1_end,
+                pipelines[0]['positive_conditioning'],
+                pipelines[0]['negative_conditioning'],
+                samples[0] if rescaled_steps > 0 else latent_image,
+                actual_steps,
+                steps_end_first,
                 "enable"  # return_with_leftover_noise
             )
-            print("First sampling pass completed successfully")
-            print(f"Output latent shape: {samples[0]['samples'].shape}")
+            print(f"First model pass completed, latent shape: {samples[0]['samples'].shape}")
         except Exception as e:
-            print(f"\n!!! ERROR in first sampling pass !!!")
-            print(f"Error type: {type(e).__name__}")
-            print(f"Error message: {str(e)}")
+            print(f"Error in first model pass: {str(e)}")
             raise e
-        
-        # Second sampling pass
-        print("\n=== Starting Second Sampling Pass ===")
-        new_total_steps = total_steps_original + total_steps_shift
-        new_cfg = starting_cfg + cfg_shift
-        model2_start_step = steps1_end + start_steps2_shift
-        model2_end_step = new_total_steps
-        
-        print(f"Using Model2 from step {model2_start_step} to {model2_end_step}")
-        print(f"New total steps: {new_total_steps}")
-        print(f"New CFG scale: {new_cfg}")
-        
-        try:
-            final_samples = KSamplerAdvanced().sample(
-                model2, 
-                "disable",  # add_noise (disabled for second pass)
-                noise_seed, 
-                new_total_steps, 
-                new_cfg, 
-                sampler_name, 
-                scheduler,
-                positive_conditioning2[0], 
-                negative_conditioning2[0], 
-                samples[0], 
-                model2_start_step, 
-                model2_end_step,
-                "enable"  # return_with_leftover_noise
-            )
-            print("Second sampling pass completed successfully")
-            print(f"Final output latent shape: {final_samples[0]['samples'].shape}")
-        except Exception as e:
-            print(f"\n!!! ERROR in second sampling pass !!!")
-            print(f"Error type: {type(e).__name__}")
-            print(f"Error message: {str(e)}")
-            raise e
-        
-        print("\n=== Sampling Completed Successfully ===")
-        return final_samples
+        if comfy.model_management.interrupted:
+            raise Exception("Execution stopped by user")
+        # Second model pass if enabled
+        if used_model_count >= 2:
+            try:
+                end_steps = steps_end_second if steps_end_second > 0 else total_steps_original + total_steps_shift_second
+                new_cfg = starting_cfg + cfg_shift
+                model2_start_step = steps_end_first + steps_shift_second
+                new_total_steps = total_steps_original + total_steps_shift_second
+                
+                samples = KSamplerAdvanced().sample(
+                    pipelines[1]['model'],
+                    "disable",
+                    noise_seed,
+                    new_total_steps,
+                    new_cfg,
+                    sampler_name,
+                    scheduler,
+                    pipelines[1]['positive_conditioning'],
+                    pipelines[1]['negative_conditioning'],
+                    samples[0],
+                    model2_start_step,
+                    end_steps,
+                    "enable"
+                )
+                print(f"Second model pass completed, latent shape: {samples[0]['samples'].shape}")
+            except Exception as e:
+                print(f"Error in second model pass: {str(e)}")
+                raise e
+        if comfy.model_management.interrupted:
+            raise Exception("Execution stopped by user")
+        # Third model pass if enabled
+        if used_model_count >= 3:
+            try:
+                new_total_steps = total_steps_original + total_steps_shift_third + total_steps_shift_second
+                new_cfg = starting_cfg + cfg_shift
+                model3_start_step = steps_end_second + steps_shift_third
+                
+                samples = KSamplerAdvanced().sample(
+                    pipelines[2]['model'],
+                    "disable",
+                    noise_seed,
+                    new_total_steps,
+                    new_cfg,
+                    sampler_name,
+                    scheduler,
+                    pipelines[2]['positive_conditioning'],
+                    pipelines[2]['negative_conditioning'],
+                    samples[0],
+                    model3_start_step,
+                    new_total_steps,
+                    "enable"
+                )
+                print(f"Third model pass completed, latent shape: {samples[0]['samples'].shape}")
+            except Exception as e:
+                print(f"Error in third model pass: {str(e)}")
+                raise e
+
+        return samples
