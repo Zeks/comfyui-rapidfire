@@ -23,6 +23,7 @@ NODE_CLASS_MAPPINGS = {
     "RapidSchedulerCombo": RapidSchedulerCombo,
     "Ranbooru": Ranbooru,
     "MultiModelAdvancedKsampler": MultiModelAdvancedKsampler,
+    "MultiModelPromptSaver": MultiModelPromptSaver,
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
@@ -35,7 +36,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RapidSchedulerSelector": "Scheduler Selector",
     "RapidSchedulerCombo": "Rapid Scheduler Combo",
     "Ranbooru": "Danbooru",
-    "MultiModelAdvancedKsampler": "MultiModelAdvancedKsampler"
+    "MultiModelAdvancedKsampler": "MultiModelAdvancedKsampler",
+    "MultiModelPromptSaver": "MultiModelPromptSaver"
 }
 
 __all__ = NODE_CLASS_MAPPINGS

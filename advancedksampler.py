@@ -4,6 +4,9 @@ from PIL.PngImagePlugin import PngInfo
 import numpy as np
 import torch
 
+from datetime import datetime
+from itertools import chain
+from comfy.cli_args import args
 import folder_paths
 import comfy.model_management
 
@@ -25,6 +28,8 @@ import comfy.sd
 from comfy_extras.nodes_align_your_steps import AlignYourStepsScheduler
 from comfy_extras.nodes_gits import GITSScheduler
 import comfy_extras.nodes_model_advanced
+
+SUPPORTED_FORMATS = [".png", ".jpg", ".jpeg", ".webp"]
 
 # Get the absolute path of various directories
 my_dir = os.path.dirname(os.path.abspath(__file__))
@@ -214,6 +219,13 @@ class MultiModelAdvancedKsampler:
         self.loaded_checkpoints = {}  # Dictionary to store loaded checkpoints by name
         self.current_checkpoints = set()  # Track currently requested checkpoints
         
+    def cleanup(self):
+        """Force cleanup of all resources"""
+        print("Performing cleanup of loaded checkpoints")
+        self.loaded_checkpoints = {}
+        self.current_checkpoints = set()
+        comfy.model_management.soft_empty_cache()        
+        
     def serialize_settings(self, **kwargs):
         """Serialize all input parameters into a human-readable string"""
         used_model_count = kwargs.get("used_model_count", 2)
@@ -336,216 +348,428 @@ class MultiModelAdvancedKsampler:
         }
 
     def sample(self, **kwargs):
-        # Get effective settings (either from load_settings or direct inputs)
-        effective_kwargs = self.get_effective_settings(**kwargs)
-        load_settings = kwargs.get("load_settings", "")
-        
-        # Initialize UI update dictionary
-        ui_updates = {}
-        
-        # If we loaded settings from the string, populate ui_updates
-        if load_settings and load_settings.strip():
-            loaded_settings = self.deserialize_settings(load_settings)
-            if loaded_settings:
-                ui_updates = {
-                    "used_model_count": (loaded_settings["used_model_count"],),
-                    "ckpt_name1": (loaded_settings["ckpt_name1"],),
-                    "ckpt_name2": (loaded_settings["ckpt_name2"],),
-                    "ckpt_name3": (loaded_settings["ckpt_name3"],),
-                    "positive": (loaded_settings["positive"],),
-                    "negative": (loaded_settings["negative"],),
-                    "lora_name": (loaded_settings["lora_name"],),
-                    "noise_seed": (loaded_settings["noise_seed"],),
-                    "rescaled_steps": (loaded_settings["rescaled_steps"],),
-                    "rescale_multiplier": (loaded_settings["rescale_multiplier"],),
-                    "total_steps_original": (loaded_settings["total_steps_original"],),
-                    "total_steps_shift_second": (loaded_settings["total_steps_shift_second"],),
-                    "total_steps_shift_third": (loaded_settings["total_steps_shift_third"],),
-                    "sampler_name": (loaded_settings["sampler_name"],),
-                    "scheduler": (loaded_settings["scheduler"],),
-                    "starting_cfg": (loaded_settings["starting_cfg"],),
-                    "cfg_shift": (loaded_settings["cfg_shift"],),
-                    "steps_end_first": (loaded_settings["steps_end_first"],),
-                    "steps_shift_second": (loaded_settings["steps_shift_second"],),
-                    "steps_end_second": (loaded_settings["steps_end_second"],),
-                    "steps_shift_third": (loaded_settings["steps_shift_third"],),
-                    "token_normalization": (loaded_settings["token_normalization"],),
-                    "weight_interpretation": (loaded_settings["weight_interpretation"],),
-                }
-        
-        # Extract all parameters from effective_kwargs
-        used_model_count = effective_kwargs["used_model_count"]
-        ckpt_name1 = effective_kwargs["ckpt_name1"]
-        ckpt_name2 = effective_kwargs["ckpt_name2"]
-        ckpt_name3 = effective_kwargs["ckpt_name3"]
-        positive = effective_kwargs["positive"]
-        negative = effective_kwargs["negative"]
-        lora_name = effective_kwargs["lora_name"]
-        noise_seed = effective_kwargs["noise_seed"]
-        rescaled_steps = effective_kwargs["rescaled_steps"]
-        rescale_multiplier = effective_kwargs["rescale_multiplier"]
-        total_steps_original = effective_kwargs["total_steps_original"]
-        total_steps_shift_second = effective_kwargs["total_steps_shift_second"]
-        total_steps_shift_third = effective_kwargs["total_steps_shift_third"]
-        sampler_name = effective_kwargs["sampler_name"]
-        scheduler = effective_kwargs["scheduler"]
-        starting_cfg = effective_kwargs["starting_cfg"]
-        cfg_shift = effective_kwargs["cfg_shift"]
-        steps_end_first = effective_kwargs["steps_end_first"]
-        steps_shift_second = effective_kwargs["steps_shift_second"]
-        steps_end_second = effective_kwargs["steps_end_second"]
-        steps_shift_third = effective_kwargs["steps_shift_third"]
-        token_normalization = effective_kwargs["token_normalization"]
-        weight_interpretation = effective_kwargs["weight_interpretation"]
-        latent_image = effective_kwargs["latent_image"]
-        
-        # Determine which checkpoints are being requested
-        requested_checkpoints = [ckpt_name1]
-        if used_model_count >= 2:
-            requested_checkpoints.append(ckpt_name2)
-            
-        if used_model_count >= 3:
-            requested_checkpoints.append(ckpt_name3)
-        
-        # Purge checkpoints that aren't being used this run
-        self.purge_unused_checkpoints(requested_checkpoints)
-        
-        # Load all required pipelines
-        pipelines = []
-        pipelines.append(self.load_model_pipeline(ckpt_name1, lora_name, positive, negative,
-                                               token_normalization, weight_interpretation))
-        if comfy.model_management.processing_interrupted():
-            return []
-        
-        if used_model_count >= 2:
-            pipelines.append(self.load_model_pipeline(ckpt_name2, lora_name, positive, negative,
-                                                    token_normalization, weight_interpretation))
-        if comfy.model_management.processing_interrupted():
-            return []
-        if used_model_count >= 3:
-            pipelines.append(self.load_model_pipeline(ckpt_name3, lora_name, positive, negative,
-                                                    token_normalization, weight_interpretation))
-
-        # First sampling pass
-        samples = []
-        if rescaled_steps > 0:
-            try:
-                CFGR = comfy_extras.nodes_model_advanced.RescaleCFG()
-                patched_model = CFGR.patch(pipelines[0]['model'], rescale_multiplier)[0]
-                print("Attempting rescaled CFG pass")
-                
-                samples = KSamplerAdvanced().sample(
-                    patched_model, 
-                    "enable",  # add_noise
-                    noise_seed, 
-                    total_steps_original, 
-                    starting_cfg, 
-                    sampler_name, 
-                    scheduler,
-                    pipelines[0]['positive_conditioning'], 
-                    pipelines[0]['negative_conditioning'], 
-                    latent_image, 
-                    0, 
-                    rescaled_steps,
-                    "enable"  # return_with_leftover_noise
-                )
-                print(f"Rescaled CFG pass completed, latent shape: {samples[0]['samples'].shape}")
-            except Exception as e:
-                print(f"Error in rescaled CFG pass: {str(e)}")
-                raise e
-        
-        if comfy.model_management.processing_interrupted():
-            return []
-        
-        # First model's main pass
         try:
-            actual_steps = rescaled_steps if rescaled_steps > 0 else 0
-            samples = KSamplerAdvanced().sample(
-                pipelines[0]['model'],
-                "disable" if rescaled_steps > 0 else "enable",  # add_noise
-                noise_seed,
-                total_steps_original,
-                starting_cfg,
-                sampler_name,
-                scheduler,
-                pipelines[0]['positive_conditioning'],
-                pipelines[0]['negative_conditioning'],
-                samples[0] if rescaled_steps > 0 else latent_image,
-                actual_steps,
-                steps_end_first,
-                "enable"  # return_with_leftover_noise
-            )
-            print(f"First model pass completed, latent shape: {samples[0]['samples'].shape}")
+            # Get effective settings (either from load_settings or direct inputs)
+            effective_kwargs = self.get_effective_settings(**kwargs)
+            load_settings = kwargs.get("load_settings", "")
+            
+            # Initialize UI update dictionary
+            ui_updates = {}
+            
+            # If we loaded settings from the string, populate ui_updates
+            if load_settings and load_settings.strip():
+                loaded_settings = self.deserialize_settings(load_settings)
+                if loaded_settings:
+                    ui_updates = {
+                        "used_model_count": (loaded_settings["used_model_count"],),
+                        "ckpt_name1": (loaded_settings["ckpt_name1"],),
+                        "ckpt_name2": (loaded_settings.get("ckpt_name2", ""),),
+                        "ckpt_name3": (loaded_settings.get("ckpt_name3", ""),),
+                        "positive": (loaded_settings["positive"],),
+                        "negative": (loaded_settings["negative"],),
+                        "lora_name": (loaded_settings["lora_name"],),
+                        "noise_seed": (loaded_settings["noise_seed"],),
+                        "rescaled_steps": (loaded_settings["rescaled_steps"],),
+                        "rescale_multiplier": (loaded_settings["rescale_multiplier"],),
+                        "total_steps_original": (loaded_settings["total_steps_original"],),
+                        "total_steps_shift_second": (loaded_settings.get("total_steps_shift_second", 0),),
+                        "total_steps_shift_third": (loaded_settings.get("total_steps_shift_third", 0),),
+                        "sampler_name": (loaded_settings["sampler_name"],),
+                        "scheduler": (loaded_settings["scheduler"],),
+                        "starting_cfg": (loaded_settings["starting_cfg"],),
+                        "cfg_shift": (loaded_settings["cfg_shift"],),
+                        "steps_end_first": (loaded_settings["steps_end_first"],),
+                        "steps_shift_second": (loaded_settings.get("steps_shift_second", 0),),
+                        "steps_end_second": (loaded_settings.get("steps_end_second", 0),),
+                        "steps_shift_third": (loaded_settings.get("steps_shift_third", 0),),
+                        "token_normalization": (loaded_settings["token_normalization"],),
+                        "weight_interpretation": (loaded_settings["weight_interpretation"],),
+                    }
+
+            # Extract all parameters from effective_kwargs
+            used_model_count = effective_kwargs["used_model_count"]
+            ckpt_name1 = effective_kwargs["ckpt_name1"]
+            ckpt_name2 = effective_kwargs.get("ckpt_name2", "")
+            ckpt_name3 = effective_kwargs.get("ckpt_name3", "")
+            positive = effective_kwargs["positive"]
+            negative = effective_kwargs["negative"]
+            lora_name = effective_kwargs["lora_name"]
+            noise_seed = effective_kwargs["noise_seed"]
+            rescaled_steps = effective_kwargs["rescaled_steps"]
+            rescale_multiplier = effective_kwargs["rescale_multiplier"]
+            total_steps_original = effective_kwargs["total_steps_original"]
+            total_steps_shift_second = effective_kwargs.get("total_steps_shift_second", 0)
+            total_steps_shift_third = effective_kwargs.get("total_steps_shift_third", 0)
+            sampler_name = effective_kwargs["sampler_name"]
+            scheduler = effective_kwargs["scheduler"]
+            starting_cfg = effective_kwargs["starting_cfg"]
+            cfg_shift = effective_kwargs["cfg_shift"]
+            steps_end_first = effective_kwargs["steps_end_first"]
+            steps_shift_second = effective_kwargs.get("steps_shift_second", 0)
+            steps_end_second = effective_kwargs.get("steps_end_second", 0)
+            steps_shift_third = effective_kwargs.get("steps_shift_third", 0)
+            token_normalization = effective_kwargs["token_normalization"]
+            weight_interpretation = effective_kwargs["weight_interpretation"]
+            latent_image = effective_kwargs["latent_image"]
+
+            # Determine which checkpoints are being requested
+            requested_checkpoints = [ckpt_name1]
+            if used_model_count >= 2 and ckpt_name2:
+                requested_checkpoints.append(ckpt_name2)
+            if used_model_count >= 3 and ckpt_name3:
+                requested_checkpoints.append(ckpt_name3)
+            
+            # Purge checkpoints that aren't being used this run
+            self.purge_unused_checkpoints(requested_checkpoints)
+            
+            # Load all required pipelines
+            pipelines = []
+            try:
+                pipelines.append(self.load_model_pipeline(ckpt_name1, lora_name, positive, negative,
+                                                       token_normalization, weight_interpretation))
+                if comfy.model_management.processing_interrupted():
+                    raise RuntimeError("Processing interrupted by user")
+                
+                if used_model_count >= 2 and ckpt_name2:
+                    pipelines.append(self.load_model_pipeline(ckpt_name2, lora_name, positive, negative,
+                                                            token_normalization, weight_interpretation))
+                    if comfy.model_management.processing_interrupted():
+                        raise RuntimeError("Processing interrupted by user")
+                
+                if used_model_count >= 3 and ckpt_name3:
+                    pipelines.append(self.load_model_pipeline(ckpt_name3, lora_name, positive, negative,
+                                                            token_normalization, weight_interpretation))
+                    if comfy.model_management.processing_interrupted():
+                        raise RuntimeError("Processing interrupted by user")
+            except Exception as e:
+                self.cleanup()
+                raise e
+
+            samples = None
+            try:
+                # First sampling pass
+                if rescaled_steps > 0:
+                    try:
+                        CFGR = comfy_extras.nodes_model_advanced.RescaleCFG()
+                        patched_model = CFGR.patch(pipelines[0]['model'], rescale_multiplier)[0]
+                        print("Attempting rescaled CFG pass")
+                        
+                        samples = KSamplerAdvanced().sample(
+                            patched_model, 
+                            "enable",  # add_noise
+                            noise_seed, 
+                            total_steps_original, 
+                            starting_cfg, 
+                            sampler_name, 
+                            scheduler,
+                            pipelines[0]['positive_conditioning'], 
+                            pipelines[0]['negative_conditioning'], 
+                            latent_image, 
+                            0, 
+                            rescaled_steps,
+                            "enable"  # return_with_leftover_noise
+                        )
+                        print(f"Rescaled CFG pass completed, latent shape: {samples[0]['samples'].shape}")
+                    except Exception as e:
+                        print(f"Error in rescaled CFG pass: {str(e)}")
+                        raise e
+                
+                if comfy.model_management.processing_interrupted():
+                    raise RuntimeError("Processing interrupted by user")
+                
+                # First model's main pass
+                try:
+                    actual_steps = rescaled_steps if rescaled_steps > 0 else 0
+                    samples = KSamplerAdvanced().sample(
+                        pipelines[0]['model'],
+                        "disable" if rescaled_steps > 0 else "enable",  # add_noise
+                        noise_seed,
+                        total_steps_original,
+                        starting_cfg,
+                        sampler_name,
+                        scheduler,
+                        pipelines[0]['positive_conditioning'],
+                        pipelines[0]['negative_conditioning'],
+                        samples[0] if rescaled_steps > 0 else latent_image,
+                        actual_steps,
+                        steps_end_first,
+                        "enable"  # return_with_leftover_noise
+                    )
+                    print(f"First model pass completed, latent shape: {samples[0]['samples'].shape}")
+                except Exception as e:
+                    print(f"Error in first model pass: {str(e)}")
+                    raise e
+                
+                if comfy.model_management.processing_interrupted():
+                    raise RuntimeError("Processing interrupted by user")
+                
+                # Second model pass if enabled
+                if used_model_count >= 2 and ckpt_name2:
+                    try:
+                        end_steps = steps_end_second if steps_end_second > 0 else total_steps_original + total_steps_shift_second
+                        new_cfg = starting_cfg + cfg_shift
+                        model2_start_step = steps_end_first + steps_shift_second
+                        new_total_steps = total_steps_original + total_steps_shift_second
+                        
+                        samples = KSamplerAdvanced().sample(
+                            pipelines[1]['model'],
+                            "disable",
+                            noise_seed,
+                            new_total_steps,
+                            new_cfg,
+                            sampler_name,
+                            scheduler,
+                            pipelines[1]['positive_conditioning'],
+                            pipelines[1]['negative_conditioning'],
+                            samples[0],
+                            model2_start_step,
+                            end_steps,
+                            "enable"
+                        )
+                        print(f"Second model pass completed, latent shape: {samples[0]['samples'].shape}")
+                    except Exception as e:
+                        print(f"Error in second model pass: {str(e)}")
+                        raise e
+                
+                if comfy.model_management.processing_interrupted():
+                    raise RuntimeError("Processing interrupted by user")
+                
+                # Third model pass if enabled
+                if used_model_count >= 3 and ckpt_name3:
+                    try:
+                        new_total_steps = total_steps_original + total_steps_shift_third + total_steps_shift_second
+                        new_cfg = starting_cfg + cfg_shift
+                        model3_start_step = steps_end_second + steps_shift_third
+                        
+                        samples = KSamplerAdvanced().sample(
+                            pipelines[2]['model'],
+                            "disable",
+                            noise_seed,
+                            new_total_steps,
+                            new_cfg,
+                            sampler_name,
+                            scheduler,
+                            pipelines[2]['positive_conditioning'],
+                            pipelines[2]['negative_conditioning'],
+                            samples[0],
+                            model3_start_step,
+                            new_total_steps,
+                            "enable"
+                        )
+                        print(f"Third model pass completed, latent shape: {samples[0]['samples'].shape}")
+                    except Exception as e:
+                        print(f"Error in third model pass: {str(e)}")
+                        raise e
+
+                # Serialize the settings used for this run
+                settings_str = self.serialize_settings(**effective_kwargs)
+                
+                return {
+                    "ui": ui_updates,
+                    "result": (samples[0], settings_str),
+                }
+                
+            except Exception as e:
+                self.cleanup()
+                if str(e) == "Processing interrupted by user":
+                    print("Processing was interrupted, cleaned up resources")
+                    return {
+                        "ui": ui_updates,
+                        "result": (latent_image, ""),
+                    }
+                else:
+                    print(f"Error during sampling: {str(e)}")
+                    raise e
+            finally:
+                if samples is None or comfy.model_management.processing_interrupted():
+                    self.cleanup()
         except Exception as e:
-            print(f"Error in first model pass: {str(e)}")
+            self.cleanup()
             raise e
         
-        if comfy.model_management.processing_interrupted():
-            return []
         
-        # Second model pass if enabled
-        if used_model_count >= 2:
-            try:
-                end_steps = steps_end_second if steps_end_second > 0 else total_steps_original + total_steps_shift_second
-                new_cfg = starting_cfg + cfg_shift
-                model2_start_step = steps_end_first + steps_shift_second
-                new_total_steps = total_steps_original + total_steps_shift_second
-                
-                samples = KSamplerAdvanced().sample(
-                    pipelines[1]['model'],
-                    "disable",
-                    noise_seed,
-                    new_total_steps,
-                    new_cfg,
-                    sampler_name,
-                    scheduler,
-                    pipelines[1]['positive_conditioning'],
-                    pipelines[1]['negative_conditioning'],
-                    samples[0],
-                    model2_start_step,
-                    end_steps,
-                    "enable"
-                )
-                print(f"Second model pass completed, latent shape: {samples[0]['samples'].shape}")
-            except Exception as e:
-                print(f"Error in second model pass: {str(e)}")
-                raise e
-        
-        if comfy.model_management.processing_interrupted():
-            return []
-        
-        # Third model pass if enabled
-        if used_model_count >= 3:
-            try:
-                new_total_steps = total_steps_original + total_steps_shift_third + total_steps_shift_second
-                new_cfg = starting_cfg + cfg_shift
-                model3_start_step = steps_end_second + steps_shift_third
-                
-                samples = KSamplerAdvanced().sample(
-                    pipelines[2]['model'],
-                    "disable",
-                    noise_seed,
-                    new_total_steps,
-                    new_cfg,
-                    sampler_name,
-                    scheduler,
-                    pipelines[2]['positive_conditioning'],
-                    pipelines[2]['negative_conditioning'],
-                    samples[0],
-                    model3_start_step,
-                    new_total_steps,
-                    "enable"
-                )
-                print(f"Third model pass completed, latent shape: {samples[0]['samples'].shape}")
-            except Exception as e:
-                print(f"Error in third model pass: {str(e)}")
-                raise e
+class MultiModelPromptSaver:
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+        self.type = "output"
+        self.prefix_append = ""
 
-        # Serialize the settings used for this run
-        settings_str = self.serialize_settings(**effective_kwargs)
-        
-        # Return both the result and UI updates
+    @classmethod
+    def INPUT_TYPES(s):
         return {
-            "ui": ui_updates,
-            "result": (samples[0], settings_str),
+            "required": {
+                "images": ("IMAGE",),
+                "settings": ("STRING", {"multiline": True}),
+            },
+            "optional": {
+                "filename": (
+                    "STRING",
+                    {"default": "ComfyUI_%time_%seed_%counter", "multiline": False},
+                ),
+                "path": ("STRING", {"default": "%date/", "multiline": False}),
+                "extension": (["png", "jpg", "jpeg", "webp"],),
+                "lossless_webp": ("BOOLEAN", {"default": True}),
+                "jpg_webp_quality": ("INT", {"default": 100, "min": 1, "max": 100}),
+                "date_format": (
+                    "STRING",
+                    {"default": "%Y-%m-%d", "multiline": False},
+                ),
+                "time_format": (
+                    "STRING",
+                    {"default": "%H%M%S", "multiline": False},
+                ),
+                "save_metadata_file": ("BOOLEAN", {"default": False}),
+            },
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("FILENAME", "FILE_PATH", "METADATA")
+    FUNCTION = "save_images"
+    OUTPUT_NODE = True
+    CATEGORY = "SD Prompt Reader"
+
+    def save_images(
+        self,
+        images,
+        settings: str,
+        filename: str = "ComfyUI_%time_%seed_%counter",
+        path: str = "%date/",
+        extension: str = "png",
+        lossless_webp: bool = True,
+        jpg_webp_quality: int = 100,
+        date_format: str = "%Y-%m-%d",
+        time_format: str = "%H%M%S",
+        save_metadata_file: bool = False,
+        prompt=None,
+        extra_pnginfo=None,
+    ):
+        (
+            full_output_folder,
+            filename_alt,
+            counter_alt,
+            subfolder_alt,
+            filename_prefix,
+        ) = folder_paths.get_save_image_path(
+            self.prefix_append,
+            self.output_dir,
+            images[0].shape[1],
+            images[0].shape[0],
+        )
+
+        results = []
+        files = []
+        file_paths = []
+        comments = []
+        
+        for image in images:
+            variable_map = {
+                "%date": self.get_time(date_format),
+                "%time": self.get_time(time_format),
+                "%extension": extension,
+                "%quality": jpg_webp_quality,
+            }
+
+            subfolder = self.get_path(path, variable_map)
+            output_folder = Path(full_output_folder) / subfolder
+            output_folder.mkdir(parents=True, exist_ok=True)
+            counter = self.get_counter(output_folder)
+            variable_map["%counter"] = f"{counter:05}"
+
+            i = 255.0 * image.cpu().numpy()
+            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+            metadata = None
+
+            stem = self.get_path(filename, variable_map)
+            file = self.get_unique_filename(stem, extension, output_folder)
+            file_path = output_folder / file
+
+            if extension == "png":
+                if not args.disable_metadata:
+                    metadata = PngInfo()
+                    metadata.add_text("parameters", settings)
+                    if prompt is not None:
+                        metadata.add_text("prompt", json.dumps(prompt))
+                    if extra_pnginfo is not None:
+                        for x in extra_pnginfo:
+                            metadata.add_text(x, json.dumps(extra_pnginfo[x]))
+                img.save(
+                    file_path,
+                    pnginfo=metadata,
+                    compress_level=4,
+                )
+            else:
+                img.save(
+                    file_path,
+                    quality=jpg_webp_quality,
+                    lossless=lossless_webp,
+                )
+                if not args.disable_metadata:
+                    metadata = piexif.dump(
+                        {
+                            "Exif": {
+                                piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(
+                                    settings, encoding="unicode"
+                                )
+                            },
+                        }
+                    )
+                    piexif.insert(metadata, str(file_path))
+
+            if save_metadata_file:
+                with open(file_path.with_suffix(".txt"), "w", encoding="utf-8") as f:
+                    f.write(settings)
+
+            results.append(
+                {"filename": file.name, "subfolder": str(subfolder), "type": self.type}
+            )
+            files.append(str(file))
+            file_paths.append(str(file_path))
+            comments.append(settings)
+
+        return {
+            "ui": {"images": results},
+            "result": (
+                self.unpack_singleton(files),
+                self.unpack_singleton(file_paths),
+                self.unpack_singleton(comments),
+            ),
+        }
+
+    @staticmethod
+    def get_counter(directory: Path):
+        img_files = list(
+            chain(*(directory.rglob(f"*{suffix}") for suffix in SUPPORTED_FORMATS))
+        )
+        return len(img_files) + 1
+
+    @staticmethod
+    def get_path(name, variable_map):
+        for variable, value in variable_map.items():
+            name = name.replace(variable, str(value))
+        return Path(name)
+
+    @staticmethod
+    def get_time(time_format):
+        now = datetime.now()
+        try:
+            time_str = now.strftime(time_format)
+            return time_str
+        except:
+            return ""
+
+    @staticmethod
+    def get_unique_filename(stem: Path, extension: str, output_folder: Path):
+        file = stem.with_suffix(f"{stem.suffix}.{extension}")
+        index = 0
+
+        while (output_folder / file).exists():
+            index += 1
+            new_stem = Path(f"{stem}_{index}")
+            file = new_stem.with_suffix(f"{new_stem.suffix}.{extension}")
+
+        return file
+
+    @staticmethod
+    def unpack_singleton(arr: list):
+        return arr[0] if len(arr) == 1 else arr        
