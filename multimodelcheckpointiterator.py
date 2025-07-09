@@ -19,6 +19,7 @@ import copy
 import subprocess
 import json
 import psutil
+import hashlib
 
 import re
 import nodes as native
@@ -174,15 +175,14 @@ class AdvancedCLIPTextEncodeWithBreak:
             out = native.ConditioningConcat.concat(self, cond_to[0], out[0])
         return out
 
-
-class MultiModelAdvancedKsampler:
+class MultiModelCheckpointIterator:
     @classmethod 
     def INPUT_TYPES(s):
         return {
             "required": { 
                 "used_model_count": ("INT",{"default": 2, "min": 1, "max": 3},),
                 "ckpt_name1": (folder_paths.get_filename_list("checkpoints"),),
-                "ckpt_name2": (folder_paths.get_filename_list("checkpoints"),),
+                "ckpt_name2_list": ("STRING", {"multiline": True, "default": ""}),
                 "ckpt_name3": (folder_paths.get_filename_list("checkpoints"),),
                 "positive": ("STRING", {"multiline": False}),
                 "negative": ("STRING", {"multiline": False}),
@@ -204,6 +204,7 @@ class MultiModelAdvancedKsampler:
                 "token_normalization": (["none", "mean", "length", "length+mean"],),
                 "weight_interpretation": (["comfy", "A1111", "compel", "comfy++" ,"down_weight"],),
                 "detached_seed": ("BOOLEAN", {"default": False}),
+                "detached_checkpoint": ("BOOLEAN", {"default": False}),
                 "latent_image": ("LATENT",),
             },
             "optional": {
@@ -219,6 +220,8 @@ class MultiModelAdvancedKsampler:
     def __init__(self):
         self.loaded_checkpoints = {}  # Dictionary to store loaded checkpoints by name
         self.current_checkpoints = set()  # Track currently requested checkpoints
+        self.ckpt_name2_index = 0  # Index for cycling through second model checkpoints
+        self.ckpt_name2_list = []  # List of second model checkpoints
         
     def cleanup(self):
         """Force cleanup of all resources"""
@@ -234,10 +237,9 @@ class MultiModelAdvancedKsampler:
         settings = {
             "used_model_count": used_model_count,
             "ckpt_name1": kwargs.get("ckpt_name1", ""),
-            # Only include ckpt_name2 if used_model_count >= 2
-            **({"ckpt_name2": kwargs.get("ckpt_name2", "")} if used_model_count >= 2 else {}),
-            # Only include ckpt_name3 if used_model_count >= 3
-            **({"ckpt_name3": kwargs.get("ckpt_name3", "")} if used_model_count >= 3 else {}),
+            "ckpt_name2": kwargs.get("ckpt_name2", ""),  # Store the currently used ckpt_name2
+            "ckpt_name2_list": kwargs.get("ckpt_name2_list", ""),  # Store the full list
+            "ckpt_name3": kwargs.get("ckpt_name3", ""),
             "positive": kwargs.get("positive", ""),
             "negative": kwargs.get("negative", ""),
             "lora_name": kwargs.get("lora_name", ""),
@@ -245,23 +247,20 @@ class MultiModelAdvancedKsampler:
             "rescaled_steps": kwargs.get("rescaled_steps", 8),
             "rescale_multiplier": kwargs.get("rescale_multiplier", 0.7),
             "total_steps_original": kwargs.get("total_steps_original", 25),
-            # Only include second model steps if used_model_count >= 2
-            **({"total_steps_shift_second": kwargs.get("total_steps_shift_second", 0)} if used_model_count >= 2 else {}),
-            # Only include third model steps if used_model_count >= 3
-            **({"total_steps_shift_third": kwargs.get("total_steps_shift_third", 0)} if used_model_count >= 3 else {}),
+            "total_steps_shift_second": kwargs.get("total_steps_shift_second", 0),
+            "total_steps_shift_third": kwargs.get("total_steps_shift_third", 0),
             "sampler_name": kwargs.get("sampler_name", "euler"),
             "scheduler": kwargs.get("scheduler", "normal"),
             "starting_cfg": kwargs.get("starting_cfg", 8.0),
             "cfg_shift": kwargs.get("cfg_shift", 0.0),
             "steps_end_first": kwargs.get("steps_end_first", 15),
-            # Only include second model steps if used_model_count >= 2
-            **({"steps_shift_second": kwargs.get("steps_shift_second", 0)} if used_model_count >= 2 else {}),
-            **({"steps_end_second": kwargs.get("steps_end_second", 0)} if used_model_count >= 2 else {}),
-            # Only include third model steps if used_model_count >= 3
-            **({"steps_shift_third": kwargs.get("steps_shift_third", 0)} if used_model_count >= 3 else {}),
+            "steps_shift_second": kwargs.get("steps_shift_second", 0),
+            "steps_end_second": kwargs.get("steps_end_second", 0),
+            "steps_shift_third": kwargs.get("steps_shift_third", 0),
             "token_normalization": kwargs.get("token_normalization", "none"),
             "weight_interpretation": kwargs.get("weight_interpretation", "comfy"),
             "detached_seed": kwargs.get("detached_seed", False),
+            "detached_checkpoint": kwargs.get("detached_checkpoint", False),
         }
         
         return json.dumps(settings, indent=2)
@@ -281,23 +280,46 @@ class MultiModelAdvancedKsampler:
         """Get the effective settings, either from load_settings or direct inputs"""
         load_settings = kwargs.get("load_settings", "")
         detached_seed = kwargs.get("detached_seed", False)
+        detached_checkpoint = kwargs.get("detached_checkpoint", False)
         
         if load_settings and load_settings.strip():
             loaded = self.deserialize_settings(load_settings)
             if loaded:
                 # Create a new kwargs with loaded settings, but keep original latent_image
                 effective_kwargs = loaded.copy()
-                if "latent_image" in kwargs:
-                    effective_kwargs["latent_image"] = kwargs["latent_image"]
+                effective_kwargs["latent_image"] = kwargs["latent_image"]
                 
                 # If detached_seed is True, override the seed from direct input
-                if detached_seed and "noise_seed" in kwargs:
+                if detached_seed:
                     effective_kwargs["noise_seed"] = kwargs["noise_seed"]
+                
+                ckpt_name2_list = kwargs.get("ckpt_name2_list", "")
+                if ckpt_name2_list:
+                    # Split the list by line breaks and clean up each entry
+                    self.ckpt_name2_list = [name.strip() for name in ckpt_name2_list.split('\n') if name.strip()]
                     
-                return effective_kwargs
-        
-        # Return None to indicate we should use direct inputs
-        return None
+                    # If we have a list, select the next checkpoint in sequence
+                    if self.ckpt_name2_list and detached_checkpoint == True:
+                        print("detached checkpoint is ON")
+                        effective_kwargs["ckpt_name2"] = self.ckpt_name2_list[self.ckpt_name2_index % len(self.ckpt_name2_list)]
+                        self.ckpt_name2_index += 1  # Increment for next run
+                    
+            return effective_kwargs
+        else:
+            # Process the ckpt_name2_list when not loading settings
+            ckpt_name2_list = kwargs.get("ckpt_name2_list", "")
+            if ckpt_name2_list:
+                # Split the list by line breaks and clean up each entry
+                self.ckpt_name2_list = [name.strip() for name in ckpt_name2_list.split('\n') if name.strip()]
+                
+                # If we have a list, select the next checkpoint in sequence
+                if self.ckpt_name2_list:
+                    kwargs["ckpt_name2"] = self.ckpt_name2_list[self.ckpt_name2_index % len(self.ckpt_name2_list)]
+                    self.ckpt_name2_index += 1  # Increment for next run
+            else:
+                kwargs["ckpt_name2"] = ""
+            
+            return kwargs
     
     def purge_unused_checkpoints(self, requested_checkpoints):
         """Purges checkpoints that aren't in the current request"""
@@ -360,9 +382,8 @@ class MultiModelAdvancedKsampler:
         try:
             # Get effective settings (either from load_settings or direct inputs)
             effective_kwargs = self.get_effective_settings(**kwargs)
-            
             if effective_kwargs is None:
-                effective_kwargs = kwargs.copy()
+                effective_kwargs = kwargs
             
             load_settings = kwargs.get("load_settings", "")
             
@@ -377,6 +398,7 @@ class MultiModelAdvancedKsampler:
                         "used_model_count": (loaded_settings["used_model_count"],),
                         "ckpt_name1": (loaded_settings["ckpt_name1"],),
                         "ckpt_name2": (loaded_settings.get("ckpt_name2", ""),),
+                        "ckpt_name2_list": (loaded_settings.get("ckpt_name2_list", ""),),
                         "ckpt_name3": (loaded_settings.get("ckpt_name3", ""),),
                         "positive": (loaded_settings["positive"],),
                         "negative": (loaded_settings["negative"],),
@@ -397,7 +419,8 @@ class MultiModelAdvancedKsampler:
                         "steps_shift_third": (loaded_settings.get("steps_shift_third", 0),),
                         "token_normalization": (loaded_settings["token_normalization"],),
                         "weight_interpretation": (loaded_settings["weight_interpretation"],),
-                         "detached_seed": (loaded_settings.get("detached_seed", False),),
+                        "detached_seed": (loaded_settings.get("detached_seed", False),),
+                        "detached_checkpoint": (loaded_settings.get("detached_checkpoint", False),),
                     }
 
             # Extract all parameters from effective_kwargs
@@ -600,13 +623,15 @@ class MultiModelAdvancedKsampler:
         except Exception as e:
             self.cleanup()
             raise e
-        
-        
-class MultiModelPromptSaver:
+            
+            
+
+class MultiModelPromptSaverIterative:
     def __init__(self):
         self.output_dir = folder_paths.get_output_directory()
         self.type = "output"
         self.prefix_append = ""
+        self.ckpt_cache = {}  # Cache for checkpoint names
 
     @classmethod
     def INPUT_TYPES(s):
@@ -618,9 +643,9 @@ class MultiModelPromptSaver:
             "optional": {
                 "filename": (
                     "STRING",
-                    {"default": "ComfyUI_%time_%seed_%counter", "multiline": False},
+                    {"default": "ComfyUI_%time_%seed_%counter_%ckpt", "multiline": False},
                 ),
-                "path": ("STRING", {"default": "%date/", "multiline": False}),
+                "path": ("STRING", {"default": "%date/%ckpt", "multiline": False}),
                 "extension": (["png", "jpg", "jpeg", "webp"],),
                 "lossless_webp": ("BOOLEAN", {"default": True}),
                 "jpg_webp_quality": ("INT", {"default": 100, "min": 1, "max": 100}),
@@ -647,8 +672,8 @@ class MultiModelPromptSaver:
         self,
         images,
         settings: str,
-        filename: str = "ComfyUI_%time_%seed_%counter",
-        path: str = "%date/",
+        filename: str = "ComfyUI_%time_%seed_%counter_%ckpt",
+        path: str = "%date/%ckpt",
         extension: str = "png",
         lossless_webp: bool = True,
         jpg_webp_quality: int = 100,
@@ -658,132 +683,194 @@ class MultiModelPromptSaver:
         prompt=None,
         extra_pnginfo=None,
     ):
-        (
-            full_output_folder,
-            filename_alt,
-            counter_alt,
-            subfolder_alt,
-            filename_prefix,
-        ) = folder_paths.get_save_image_path(
-            self.prefix_append,
-            self.output_dir,
-            images[0].shape[1],
-            images[0].shape[0],
-        )
+        # Get or generate cache key for settings
+        settings_hash = hashlib.md5(settings.encode()).hexdigest()
+        
+        # Check cache first
+        if settings_hash in self.ckpt_cache:
+            ckpt_name = self.ckpt_cache[settings_hash]
+        else:
+            ckpt_name = self.extract_checkpoint_name(settings)
+            self.ckpt_cache[settings_hash] = ckpt_name
 
+        # Prepare variable substitutions
+        variable_map = {
+            "%date": self.get_time(date_format),
+            "%time": self.get_time(time_format),
+            "%extension": extension,
+            "%quality": jpg_webp_quality,
+            "%ckpt": ckpt_name or "unknown_model",
+        }
+
+        # Get output paths
+        full_output_folder = folder_paths.get_output_directory()
+        subfolder = self.get_path(path, variable_map)
+        output_folder = Path(full_output_folder) / subfolder
+        output_folder.mkdir(parents=True, exist_ok=True)
+        
+        # Process images
         results = []
         files = []
         file_paths = []
-        comments = []
         
         for image in images:
-            variable_map = {
-                "%date": self.get_time(date_format),
-                "%time": self.get_time(time_format),
-                "%extension": extension,
-                "%quality": jpg_webp_quality,
-            }
-
-            subfolder = self.get_path(path, variable_map)
-            output_folder = Path(full_output_folder) / subfolder
-            output_folder.mkdir(parents=True, exist_ok=True)
+            # Update counter for each image
             counter = self.get_counter(output_folder)
             variable_map["%counter"] = f"{counter:05}"
-
-            i = 255.0 * image.cpu().numpy()
-            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
-            metadata = None
-
+            
+            # Generate filename
             stem = self.get_path(filename, variable_map)
             file = self.get_unique_filename(stem, extension, output_folder)
             file_path = output_folder / file
 
-            if extension == "png":
-                if not args.disable_metadata:
-                    metadata = PngInfo()
-                    metadata.add_text("parameters", settings)
-                    if prompt is not None:
-                        metadata.add_text("prompt", json.dumps(prompt))
-                    if extra_pnginfo is not None:
-                        for x in extra_pnginfo:
-                            metadata.add_text(x, json.dumps(extra_pnginfo[x]))
-                img.save(
-                    file_path,
-                    pnginfo=metadata,
-                    compress_level=4,
-                )
-            else:
-                img.save(
-                    file_path,
-                    quality=jpg_webp_quality,
-                    lossless=lossless_webp,
-                )
-                if not args.disable_metadata:
-                    metadata = piexif.dump(
-                        {
-                            "Exif": {
-                                piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(
-                                    settings, encoding="unicode"
-                                )
-                            },
-                        }
-                    )
-                    piexif.insert(metadata, str(file_path))
-
-            if save_metadata_file:
-                with open(file_path.with_suffix(".txt"), "w", encoding="utf-8") as f:
-                    f.write(settings)
-
-            results.append(
-                {"filename": file.name, "subfolder": str(subfolder), "type": self.type}
+            # Convert and save image
+            img = self.tensor_to_image(image)
+            self.save_image_with_metadata(
+                img, 
+                file_path, 
+                extension, 
+                settings, 
+                prompt, 
+                extra_pnginfo,
+                lossless_webp,
+                jpg_webp_quality
             )
+
+            # Save metadata file if requested
+            if save_metadata_file:
+                self.save_metadata_file(file_path, settings)
+
+            # Store results
+            results.append({
+                "filename": file.name, 
+                "subfolder": str(subfolder), 
+                "type": self.type
+            })
             files.append(str(file))
             file_paths.append(str(file_path))
-            comments.append(settings)
 
         return {
             "ui": {"images": results},
             "result": (
                 self.unpack_singleton(files),
                 self.unpack_singleton(file_paths),
-                self.unpack_singleton(comments),
+                settings,  # Return original settings as metadata
             ),
         }
 
+    def extract_checkpoint_name(self, settings_str: str) -> str:
+        """Robust checkpoint name extraction from settings string"""
+        if not settings_str.strip():
+            return ""
+
+        try:
+            # First try direct JSON parse
+            try:
+                settings = json.loads(settings_str)
+            except json.JSONDecodeError:
+                # Handle cases where settings might be wrapped in metadata
+                if settings_str.startswith('{"parameters":'):
+                    settings = json.loads(settings_str)
+                    settings_str = settings.get("parameters", "")
+                    settings = json.loads(settings_str)
+                else:
+                    return ""
+
+            # Try to find checkpoint names in various locations
+            ckpt_name = (
+                settings.get("ckpt_name2") or 
+                settings.get("ckpt_name1") or 
+                ""
+            )
+
+            # Clean up the name
+            if ckpt_name:
+                ckpt_name = Path(ckpt_name).stem
+                ckpt_name = re.sub(r'[\\/:*?"<>|\s]', '_', ckpt_name)
+                ckpt_name = re.sub(r'_{2,}', '_', ckpt_name).strip('_')
+                return ckpt_name[:64]  # Limit length
+            
+            return ""
+        except Exception as e:
+            print(f"Error extracting checkpoint: {str(e)}")
+            return ""
+
+    def tensor_to_image(self, tensor):
+        """Convert torch tensor to PIL Image"""
+        i = 255.0 * tensor.cpu().numpy()
+        return Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+
+    def save_image_with_metadata(
+        self, 
+        img, 
+        file_path, 
+        extension, 
+        settings, 
+        prompt, 
+        extra_pnginfo,
+        lossless_webp,
+        quality
+    ):
+        """Save image with appropriate metadata"""
+        if extension == "png":
+            metadata = PngInfo()
+            if not args.disable_metadata:
+                metadata.add_text("parameters", settings)
+                if prompt is not None:
+                    metadata.add_text("prompt", json.dumps(prompt))
+                if extra_pnginfo is not None:
+                    for x in extra_pnginfo:
+                        metadata.add_text(x, json.dumps(extra_pnginfo[x]))
+            img.save(file_path, pnginfo=metadata, compress_level=4)
+        else:
+            img.save(file_path, quality=quality, lossless=lossless_webp)
+            if not args.disable_metadata:
+                metadata = piexif.dump({
+                    "Exif": {
+                        piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(
+                            settings, encoding="unicode"
+                        )
+                    },
+                })
+                piexif.insert(metadata, str(file_path))
+
+    def save_metadata_file(self, file_path, settings):
+        """Save metadata to separate text file"""
+        with open(file_path.with_suffix(".txt"), "w", encoding="utf-8") as f:
+            f.write(settings)
+
     @staticmethod
     def get_counter(directory: Path):
-        img_files = list(
-            chain(*(directory.rglob(f"*{suffix}") for suffix in SUPPORTED_FORMATS))
-        )
-        return len(img_files) + 1
+        """Get next counter value for directory"""
+        existing = list(directory.glob("*"))
+        return len(existing) + 1
 
     @staticmethod
     def get_path(name, variable_map):
-        for variable, value in variable_map.items():
-            name = name.replace(variable, str(value))
+        """Apply variable substitutions to path/filename"""
+        for var, val in variable_map.items():
+            name = name.replace(var, str(val))
         return Path(name)
 
     @staticmethod
     def get_time(time_format):
-        now = datetime.now()
+        """Get formatted time string"""
         try:
-            time_str = now.strftime(time_format)
-            return time_str
+            return datetime.now().strftime(time_format)
         except:
             return ""
 
     @staticmethod
     def get_unique_filename(stem: Path, extension: str, output_folder: Path):
-        file = stem.with_suffix(f"{stem.suffix}.{extension}")
+        """Generate unique filename by appending index if needed"""
+        file = stem.with_suffix(f".{extension}")
         index = 0
-
         while (output_folder / file).exists():
             index += 1
-            new_stem = Path(f"{stem}_{index}")
-            file = new_stem.with_suffix(f"{new_stem.suffix}.{extension}")
-
+            file = stem.with_name(f"{stem.name}_{index}").with_suffix(f".{extension}")
         return file
 
     @staticmethod
     def unpack_singleton(arr: list):
-        return arr[0] if len(arr) == 1 else arr        
+        """Return single item or full list"""
+        return arr[0] if len(arr) == 1 else arr

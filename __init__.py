@@ -8,6 +8,7 @@ from .escapedfind import BracketEscaper
 from .girlselector import RandomCharacterSelector
 from .schedulerselector import *
 from .advancedksampler import *
+from .multimodelcheckpointiterator import *
 from .danbooru import Ranbooru
 
 
@@ -23,7 +24,9 @@ NODE_CLASS_MAPPINGS = {
     "RapidSchedulerCombo": RapidSchedulerCombo,
     "Ranbooru": Ranbooru,
     "MultiModelAdvancedKsampler": MultiModelAdvancedKsampler,
+    "MultiModelCheckpointIterator": MultiModelCheckpointIterator,
     "MultiModelPromptSaver": MultiModelPromptSaver,
+    "MultiModelPromptSaverIterative": MultiModelPromptSaverIterative,
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
@@ -37,12 +40,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RapidSchedulerCombo": "Rapid Scheduler Combo",
     "Ranbooru": "Danbooru",
     "MultiModelAdvancedKsampler": "MultiModelAdvancedKsampler",
-    "MultiModelPromptSaver": "MultiModelPromptSaver"
+    "MultiModelCheckpointIterator": "MultiModelCheckpointIterator",
+    "MultiModelPromptSaver": "MultiModelPromptSaver",
+    "MultiModelPromptSaverIterative": "MultiModelPromptSaverIterative"
 }
 
 __all__ = NODE_CLASS_MAPPINGS
 
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+
 
 
