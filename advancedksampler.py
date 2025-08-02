@@ -3,6 +3,7 @@ from PIL import Image, ImageOps, ImageDraw, ImageFont
 from PIL.PngImagePlugin import PngInfo
 import numpy as np
 import torch
+import gc
 
 from datetime import datetime
 from itertools import chain
@@ -22,7 +23,7 @@ import psutil
 
 import re
 import nodes as native
-from .adv_encode import advanced_encode #, advanced_encode_XL
+from .adv_encode import advanced_encode
 
 import comfy.sd
 from comfy_extras.nodes_align_your_steps import AlignYourStepsScheduler
@@ -58,7 +59,6 @@ from comfy import samplers
 sys.path.append(custom_nodes_dir)
 
 
-
 class LoraTagLoader:
     def __init__(self):
         self.loaded_lora = None
@@ -77,10 +77,7 @@ class LoraTagLoader:
     CATEGORY = "loaders"
 
     def load_lora(self, model, clip, text):
-        # print(f"\nLoraTagLoader input text: { text }")
-
         founds = re.findall(self.tag_pattern, text)
-        # print(f"\nfoound lora tags: { founds }")
 
         if len(founds) < 1:
             return (model, clip, text)
@@ -165,17 +162,20 @@ class AdvancedCLIPTextEncodeWithBreak:
         prompts = re.split(r"\s*\bBREAK\b\s*", text) 
         # encode first prompt fragment
         prompt = prompts.pop(0)
-        # print(f"prompt: {prompt}")
         out = self._encode(clip, prompt, token_normalization, weight_interpretation)
         # encode and concatenate the rest of the prompt
         for prompt in prompts:
-            # print(f"prompt: {prompt}")
             cond_to = self._encode(clip, prompt, token_normalization, weight_interpretation)
             out = native.ConditioningConcat.concat(self, cond_to[0], out[0])
         return out
 
 
 class MultiModelAdvancedKsampler:
+    def __init__(self):
+        self.loaded_checkpoints = {}  # Dictionary to store loaded checkpoints by name
+        self.loaded_loras = {}        # Dictionary to store loaded LoRAs by path
+        self.current_checkpoints = set()  # Track currently requested checkpoints
+        
     @classmethod 
     def INPUT_TYPES(s):
         return {
@@ -211,21 +211,39 @@ class MultiModelAdvancedKsampler:
             }
         }
 
-    RETURN_TYPES = ("LATENT", "STRING")
-    RETURN_NAMES = ("LATENT", "settings")
+    RETURN_TYPES = ("LATENT", "STRING", "INT", "STRING", "STRING")
+    RETURN_NAMES = ("LATENT", "prompt", "seed", "lora", "settings")
     FUNCTION = "sample"
     CATEGORY = "sampling"
     
-    def __init__(self):
-        self.loaded_checkpoints = {}  # Dictionary to store loaded checkpoints by name
-        self.current_checkpoints = set()  # Track currently requested checkpoints
+    def print_memory_usage(self):
+        process = psutil.Process(os.getpid())
+        print(f"Memory usage: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+        print(f"Loaded checkpoints: {len(self.loaded_checkpoints)}")
+        print(f"Loaded LoRAs: {len(self.loaded_loras)}")
         
     def cleanup(self):
         """Force cleanup of all resources"""
-        print("Performing cleanup of loaded checkpoints")
+        print("Performing full cleanup of loaded models and LoRAs")
+        
+        # Clear checkpoints
+        for name, (model, clip, vae) in self.loaded_checkpoints.items():
+            del model
+            del clip
+            del vae
         self.loaded_checkpoints = {}
+        
+        # Clear LoRAs
+        for path, lora in self.loaded_loras.items():
+            del lora
+        self.loaded_loras = {}
+        
         self.current_checkpoints = set()
-        comfy.model_management.soft_empty_cache()        
+        
+        # Force garbage collection
+        gc.collect()
+        comfy.model_management.soft_empty_cache()
+        self.print_memory_usage()
         
     def serialize_settings(self, **kwargs):
         """Serialize all input parameters into a human-readable string"""
@@ -234,9 +252,7 @@ class MultiModelAdvancedKsampler:
         settings = {
             "used_model_count": used_model_count,
             "ckpt_name1": kwargs.get("ckpt_name1", ""),
-            # Only include ckpt_name2 if used_model_count >= 2
             **({"ckpt_name2": kwargs.get("ckpt_name2", "")} if used_model_count >= 2 else {}),
-            # Only include ckpt_name3 if used_model_count >= 3
             **({"ckpt_name3": kwargs.get("ckpt_name3", "")} if used_model_count >= 3 else {}),
             "positive": kwargs.get("positive", ""),
             "negative": kwargs.get("negative", ""),
@@ -245,19 +261,15 @@ class MultiModelAdvancedKsampler:
             "rescaled_steps": kwargs.get("rescaled_steps", 8),
             "rescale_multiplier": kwargs.get("rescale_multiplier", 0.7),
             "total_steps_original": kwargs.get("total_steps_original", 25),
-            # Only include second model steps if used_model_count >= 2
             **({"total_steps_shift_second": kwargs.get("total_steps_shift_second", 0)} if used_model_count >= 2 else {}),
-            # Only include third model steps if used_model_count >= 3
             **({"total_steps_shift_third": kwargs.get("total_steps_shift_third", 0)} if used_model_count >= 3 else {}),
             "sampler_name": kwargs.get("sampler_name", "euler"),
             "scheduler": kwargs.get("scheduler", "normal"),
             "starting_cfg": kwargs.get("starting_cfg", 8.0),
             "cfg_shift": kwargs.get("cfg_shift", 0.0),
             "steps_end_first": kwargs.get("steps_end_first", 15),
-            # Only include second model steps if used_model_count >= 2
             **({"steps_shift_second": kwargs.get("steps_shift_second", 0)} if used_model_count >= 2 else {}),
             **({"steps_end_second": kwargs.get("steps_end_second", 0)} if used_model_count >= 2 else {}),
-            # Only include third model steps if used_model_count >= 3
             **({"steps_shift_third": kwargs.get("steps_shift_third", 0)} if used_model_count >= 3 else {}),
             "token_normalization": kwargs.get("token_normalization", "none"),
             "weight_interpretation": kwargs.get("weight_interpretation", "comfy"),
@@ -311,6 +323,10 @@ class MultiModelAdvancedKsampler:
         # Purge unused checkpoints
         for name in to_remove:
             print(f"Purging unused checkpoint: {name}")
+            model, clip, vae = self.loaded_checkpoints[name]
+            del model
+            del clip
+            del vae
             del self.loaded_checkpoints[name]
         
         # Update current checkpoints
@@ -319,6 +335,8 @@ class MultiModelAdvancedKsampler:
     def load_model_pipeline(self, ckpt_name, lora_name, positive, negative,
                           token_normalization, weight_interpretation):
         """Helper function to load a complete model pipeline"""
+        self.print_memory_usage()
+        
         # Check if we already have this checkpoint loaded
         if ckpt_name in self.loaded_checkpoints:
             model, clip, vae = self.loaded_checkpoints[ckpt_name]
@@ -337,7 +355,14 @@ class MultiModelAdvancedKsampler:
         
         # Apply LoRA if specified
         if lora_name and lora_name.strip():
-            model, clip, _ = LoraTagLoader().load_lora(model, clip, lora_name)
+            # Create a new LoraTagLoader instance for each call
+            lora_loader = LoraTagLoader()
+            model, clip, _ = lora_loader.load_lora(model, clip, lora_name)
+            
+            # Store the loaded LoRA reference if the loader has one
+            if lora_loader.loaded_lora is not None:
+                lora_path, lora = lora_loader.loaded_lora
+                self.loaded_loras[lora_path] = lora
         
         # Generate conditioning
         positive_conditioning = AdvancedCLIPTextEncodeWithBreak().encode(
@@ -358,6 +383,9 @@ class MultiModelAdvancedKsampler:
 
     def sample(self, **kwargs):
         try:
+            # Print initial memory usage
+            self.print_memory_usage()
+            
             # Get effective settings (either from load_settings or direct inputs)
             effective_kwargs = self.get_effective_settings(**kwargs)
             
@@ -397,7 +425,7 @@ class MultiModelAdvancedKsampler:
                         "steps_shift_third": (loaded_settings.get("steps_shift_third", 0),),
                         "token_normalization": (loaded_settings["token_normalization"],),
                         "weight_interpretation": (loaded_settings["weight_interpretation"],),
-                         "detached_seed": (loaded_settings.get("detached_seed", False),),
+                        "detached_seed": (loaded_settings.get("detached_seed", False),),
                     }
 
             # Extract all parameters from effective_kwargs
@@ -578,9 +606,12 @@ class MultiModelAdvancedKsampler:
                 # Serialize the settings used for this run
                 settings_str = self.serialize_settings(**effective_kwargs)
                 
+                # Print final memory usage
+                self.print_memory_usage()
+                
                 return {
                     "ui": ui_updates,
-                    "result": (samples[0], settings_str),
+                    "result": (samples[0], positive, noise_seed, lora_name, settings_str),
                 }
                 
             except Exception as e:
@@ -600,8 +631,8 @@ class MultiModelAdvancedKsampler:
         except Exception as e:
             self.cleanup()
             raise e
-        
-        
+
+
 class MultiModelPromptSaver:
     def __init__(self):
         self.output_dir = folder_paths.get_output_directory()
@@ -786,4 +817,4 @@ class MultiModelPromptSaver:
 
     @staticmethod
     def unpack_singleton(arr: list):
-        return arr[0] if len(arr) == 1 else arr        
+        return arr[0] if len(arr) == 1 else arr

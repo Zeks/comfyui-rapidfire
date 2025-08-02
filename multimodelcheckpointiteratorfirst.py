@@ -187,15 +187,15 @@ class AdvancedCLIPTextEncodeWithBreak:
             cond_to = self._encode(clip, prompt, token_normalization, weight_interpretation)
             out = native.ConditioningConcat.concat(self, cond_to[0], out[0])
         return out
-
-class MultiModelCheckpointIterator:
+        
+class MultiModelCheckpointIteratorFirst:
     @classmethod 
     def INPUT_TYPES(s):
         return {
             "required": { 
                 "used_model_count": ("INT",{"default": 2, "min": 1, "max": 3},),
-                "ckpt_name1": (folder_paths.get_filename_list("checkpoints"),),
-                "ckpt_name2_list": ("STRING", {"multiline": True, "default": ""}),
+                "ckpt_name1_list": ("STRING", {"multiline": True, "default": ""}),
+                "ckpt_name2": (folder_paths.get_filename_list("checkpoints"),),
                 "ckpt_name3": (folder_paths.get_filename_list("checkpoints"),),
                 "positive": ("STRING", {"multiline": False}),
                 "negative": ("STRING", {"multiline": False}),
@@ -218,8 +218,6 @@ class MultiModelCheckpointIterator:
                 "weight_interpretation": (["comfy", "A1111", "compel", "comfy++" ,"down_weight"],),
                 "detached_seed": ("BOOLEAN", {"default": False}),
                 "detached_checkpoint": ("BOOLEAN", {"default": False}),
-                "reset_rng": ("BOOLEAN", {"default": False}),  # New toggle
-                "random_checkpoint": ("BOOLEAN", {"default": False}),  # New toggle
                 "latent_image": ("LATENT",),
             },
             "optional": {
@@ -235,8 +233,8 @@ class MultiModelCheckpointIterator:
     def __init__(self):
         self.loaded_checkpoints = {}  # Dictionary to store loaded checkpoints by name
         self.current_checkpoints = set()  # Track currently requested checkpoints
-        self.ckpt_name2_index = 0  # Index for cycling through second model checkpoints
-        self.ckpt_name2_list = []  # List of second model checkpoints
+        self.ckpt_name1_index = 0  # Index for cycling through first model checkpoints
+        self.ckpt_name1_list = []  # List of first model checkpoints
         
     def cleanup(self):
         """Force cleanup of all resources"""
@@ -251,9 +249,9 @@ class MultiModelCheckpointIterator:
         
         settings = {
             "used_model_count": used_model_count,
-            "ckpt_name1": kwargs.get("ckpt_name1", ""),
-            "ckpt_name2": kwargs.get("ckpt_name2", ""),  # Store the currently used ckpt_name2
-            "ckpt_name2_list": kwargs.get("ckpt_name2_list", ""),  # Store the full list
+            "ckpt_name1": kwargs.get("ckpt_name1", ""),  # Store the currently used ckpt_name1
+            "ckpt_name1_list": kwargs.get("ckpt_name1_list", ""),  # Store the full list
+            "ckpt_name2": kwargs.get("ckpt_name2", ""),
             "ckpt_name3": kwargs.get("ckpt_name3", ""),
             "positive": kwargs.get("positive", ""),
             "negative": kwargs.get("negative", ""),
@@ -276,8 +274,6 @@ class MultiModelCheckpointIterator:
             "weight_interpretation": kwargs.get("weight_interpretation", "comfy"),
             "detached_seed": kwargs.get("detached_seed", False),
             "detached_checkpoint": kwargs.get("detached_checkpoint", False),
-            "reset_rng": kwargs.get("reset_rng", False),  # Include new toggle
-            "random_checkpoint": kwargs.get("random_checkpoint", False),  # Include new toggle
         }
         
         return json.dumps(settings, indent=2)
@@ -298,8 +294,6 @@ class MultiModelCheckpointIterator:
         load_settings = kwargs.get("load_settings", "")
         detached_seed = kwargs.get("detached_seed", False)
         detached_checkpoint = kwargs.get("detached_checkpoint", False)
-        reset_rng = kwargs.get("reset_rng", False)
-        random_checkpoint = kwargs.get("random_checkpoint", False)
         
         if load_settings and load_settings.strip():
             loaded = self.deserialize_settings(load_settings)
@@ -312,48 +306,31 @@ class MultiModelCheckpointIterator:
                 if detached_seed:
                     effective_kwargs["noise_seed"] = kwargs["noise_seed"]
                 
-                ckpt_name2_list = kwargs.get("ckpt_name2_list", "")
-                if ckpt_name2_list:
+                ckpt_name1_list = kwargs.get("ckpt_name1_list", "")
+                if ckpt_name1_list:
                     # Split the list by line breaks and clean up each entry
-                    self.ckpt_name2_list = [name.strip() for name in ckpt_name2_list.split('\n') if name.strip()]
+                    self.ckpt_name1_list = [name.strip() for name in ckpt_name1_list.split('\n') if name.strip()]
                     
-                    # Handle random checkpoint selection
-                    if self.ckpt_name2_list and detached_checkpoint:
-                        if reset_rng:
-                            self.ckpt_name2_index = 0  # Reset counter if requested
-                            
-                        if random_checkpoint:
-                            # Select a random checkpoint from the list
-                            import random
-                            effective_kwargs["ckpt_name2"] = random.choice(self.ckpt_name2_list)
-                        else:
-                            # Sequential selection
-                            effective_kwargs["ckpt_name2"] = self.ckpt_name2_list[self.ckpt_name2_index % len(self.ckpt_name2_list)]
-                            self.ckpt_name2_index += 1  # Increment for next run
+                    # If we have a list, select the next checkpoint in sequence
+                    if self.ckpt_name1_list and detached_checkpoint == True:
+                        print("detached checkpoint is ON")
+                        effective_kwargs["ckpt_name1"] = self.ckpt_name1_list[self.ckpt_name1_index % len(self.ckpt_name1_list)]
+                        self.ckpt_name1_index += 1  # Increment for next run
                     
             return effective_kwargs
         else:
-            # Process the ckpt_name2_list when not loading settings
-            ckpt_name2_list = kwargs.get("ckpt_name2_list", "")
-            if ckpt_name2_list:
+            # Process the ckpt_name1_list when not loading settings
+            ckpt_name1_list = kwargs.get("ckpt_name1_list", "")
+            if ckpt_name1_list:
                 # Split the list by line breaks and clean up each entry
-                self.ckpt_name2_list = [name.strip() for name in ckpt_name2_list.split('\n') if name.strip()]
+                self.ckpt_name1_list = [name.strip() for name in ckpt_name1_list.split('\n') if name.strip()]
                 
-                # Handle random checkpoint selection
-                if self.ckpt_name2_list:
-                    if reset_rng:
-                        self.ckpt_name2_index = 0  # Reset counter if requested
-                        
-                    if random_checkpoint:
-                        # Select a random checkpoint from the list
-                        import random
-                        kwargs["ckpt_name2"] = random.choice(self.ckpt_name2_list)
-                    else:
-                        # Sequential selection
-                        kwargs["ckpt_name2"] = self.ckpt_name2_list[self.ckpt_name2_index % len(self.ckpt_name2_list)]
-                        self.ckpt_name2_index += 1  # Increment for next run
+                # If we have a list, select the next checkpoint in sequence
+                if self.ckpt_name1_list:
+                    kwargs["ckpt_name1"] = self.ckpt_name1_list[self.ckpt_name1_index % len(self.ckpt_name1_list)]
+                    self.ckpt_name1_index += 1  # Increment for next run
             else:
-                kwargs["ckpt_name2"] = ""
+                kwargs["ckpt_name1"] = ""
             
             return kwargs
     
@@ -433,8 +410,8 @@ class MultiModelCheckpointIterator:
                     ui_updates = {
                         "used_model_count": (loaded_settings["used_model_count"],),
                         "ckpt_name1": (loaded_settings["ckpt_name1"],),
+                        "ckpt_name1_list": (loaded_settings.get("ckpt_name1_list", ""),),
                         "ckpt_name2": (loaded_settings.get("ckpt_name2", ""),),
-                        "ckpt_name2_list": (loaded_settings.get("ckpt_name2_list", ""),),
                         "ckpt_name3": (loaded_settings.get("ckpt_name3", ""),),
                         "positive": (loaded_settings["positive"],),
                         "negative": (loaded_settings["negative"],),
@@ -457,8 +434,6 @@ class MultiModelCheckpointIterator:
                         "weight_interpretation": (loaded_settings["weight_interpretation"],),
                         "detached_seed": (loaded_settings.get("detached_seed", False),),
                         "detached_checkpoint": (loaded_settings.get("detached_checkpoint", False),),
-                        "reset_rng": (loaded_settings.get("reset_rng", False),),  # Update UI
-                        "random_checkpoint": (loaded_settings.get("random_checkpoint", False),),  # Update UI
                     }
 
             # Extract all parameters from effective_kwargs
@@ -523,15 +498,11 @@ class MultiModelCheckpointIterator:
             samples = None
             try:
                 # First sampling pass
-                if rescaled_steps >= 0:  # Changed from > 0 to >= 0 to handle 0 case
+                if rescaled_steps > 0:
                     try:
-                        if rescaled_steps > 0:  # Only apply RescaleCFG if steps > 0
-                            CFGR = comfy_extras.nodes_model_advanced.RescaleCFG()
-                            patched_model = CFGR.patch(pipelines[0]['model'], rescale_multiplier)[0]
-                            print("Attempting rescaled CFG pass")
-                        else:
-                            patched_model = pipelines[0]['model']
-                            print("Skipping rescaled CFG pass (0 steps)")
+                        CFGR = comfy_extras.nodes_model_advanced.RescaleCFG()
+                        patched_model = CFGR.patch(pipelines[0]['model'], rescale_multiplier)[0]
+                        print("Attempting rescaled CFG pass")
                         
                         samples = KSamplerAdvanced().sample(
                             patched_model, 
@@ -558,10 +529,10 @@ class MultiModelCheckpointIterator:
                 
                 # First model's main pass
                 try:
-                    actual_steps = rescaled_steps if rescaled_steps >= 0 else 0  # Changed condition
+                    actual_steps = rescaled_steps if rescaled_steps > 0 else 0
                     samples = KSamplerAdvanced().sample(
                         pipelines[0]['model'],
-                        "disable" if rescaled_steps >= 0 else "enable",  # Changed condition
+                        "disable" if rescaled_steps > 0 else "enable",  # add_noise
                         noise_seed,
                         total_steps_original,
                         starting_cfg,
@@ -569,7 +540,7 @@ class MultiModelCheckpointIterator:
                         scheduler,
                         pipelines[0]['positive_conditioning'],
                         pipelines[0]['negative_conditioning'],
-                        samples[0] if rescaled_steps >= 0 else latent_image,  # Changed condition
+                        samples[0] if rescaled_steps > 0 else latent_image,
                         actual_steps,
                         steps_end_first,
                         "enable"  # return_with_leftover_noise
