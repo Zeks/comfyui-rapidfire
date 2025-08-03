@@ -1,5 +1,5 @@
 import os
-import csv
+import json
 from datetime import datetime
 
 class CsvWriterNode:
@@ -8,45 +8,37 @@ class CsvWriterNode:
         return {
             "required": {
                 "seed": ("INT", {"default": 23948457612}),
-                "width": ("INT", {"default": ""}),
-                "height": ("INT", {"default": ""}),
+                "width": ("INT", {"default": 1024}),
+                "height": ("INT", {"default": 1024}),
                 "body": ("STRING", {"default": ""})
             }
         }
 
     RETURN_TYPES = ()
-    FUNCTION = "writeToCSV"
-    OUTPUT_NODE = True  # This node will perform a write operation and does not return anything to the pipeline.
-
+    FUNCTION = "append_to_jsonl"
+    OUTPUT_NODE = True
     CATEGORY = "utils"
 
-    def writeToCSV(self, seed, width, height, body):
+    def append_to_jsonl(self, seed, width, height, body):
         current_date = datetime.now().strftime("%Y-%m-%d")
+        output_dir = os.path.join("output", "rapidfire", current_date)
+        os.makedirs(output_dir, exist_ok=True)
+        jsonl_path = os.path.join(output_dir, "data.jsonl")
 
-        # Define the CSV file name and path
-        csv_filename = f"ComfyUI/output/rapidfire/{current_date}/data.csv"
+        # Compose the record
+        record = {
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "seed": int(seed),
+            "width": int(width) if isinstance(width, (int, str)) and str(width).isdigit() else 1024,
+            "height": int(height) if isinstance(height, (int, str)) and str(height).isdigit() else 1024,
+            "body": body or ""
+        }
 
-        # Ensure the 'data' directory exists
-        os.makedirs(os.path.dirname(csv_filename), exist_ok=True)
-
-        # Get the current time in the format HH:MM:SS
-        current_time = datetime.now().strftime("%H:%M:%S")
-
-        # Prepare the row to be written
-        row_to_write = [current_time, str(seed), width, height, body]
-
-        # Determine if we need to write headers (if file does not exist)
-        needs_header = not os.path.exists(csv_filename) or os.stat(csv_filename).st_size == 0
-
-        with open(csv_filename, mode='a', newline='', encoding='utf-8') as csvfile:
-            writer = csv.writer(csvfile, quoting=csv.QUOTE_ALL)
-
-            if needs_header:
-                # Write headers
-                writer.writerow(["timestamp", "seed",  "width", "height", "body"])
-
-            # Write the row to the CSV file
-            writer.writerow(row_to_write)
+        # Append as a single JSON line
+        try:
+            with open(jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"[JsonAppenderNode] failed to write JSONL: {e}")
 
         return ()
-

@@ -34,7 +34,7 @@ class ImmatureImageCounter:
                 return (0,)
 
         # Define the image folder path
-        image_folder_path = f"ComfyUI/output/rapidfire/{current_date}/{subfolder}"
+        image_folder_path = f"output/rapidfire/{current_date}/{subfolder}"
 
         # Initialize PNG file count
         png_count = 0

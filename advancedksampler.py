@@ -3,7 +3,6 @@ from PIL import Image, ImageOps, ImageDraw, ImageFont
 from PIL.PngImagePlugin import PngInfo
 import numpy as np
 import torch
-import gc
 
 from datetime import datetime
 from itertools import chain
@@ -15,6 +14,7 @@ import ast
 from pathlib import Path
 from importlib import import_module
 import os
+import gc
 import sys
 import copy
 import subprocess
@@ -23,7 +23,8 @@ import psutil
 
 import re
 import nodes as native
-from .adv_encode import advanced_encode
+from .adv_encode import advanced_encode #, advanced_encode_XL
+from .sampler_nodes import KSamplerAdvanced_progress
 
 import comfy.sd
 from comfy_extras.nodes_align_your_steps import AlignYourStepsScheduler
@@ -59,6 +60,7 @@ from comfy import samplers
 sys.path.append(custom_nodes_dir)
 
 
+
 class LoraTagLoader:
     def __init__(self):
         self.loaded_lora = None
@@ -77,7 +79,10 @@ class LoraTagLoader:
     CATEGORY = "loaders"
 
     def load_lora(self, model, clip, text):
+        # print(f"\nLoraTagLoader input text: { text }")
+
         founds = re.findall(self.tag_pattern, text)
+        # print(f"\nfoound lora tags: { founds }")
 
         if len(founds) < 1:
             return (model, clip, text)
@@ -162,13 +167,14 @@ class AdvancedCLIPTextEncodeWithBreak:
         prompts = re.split(r"\s*\bBREAK\b\s*", text) 
         # encode first prompt fragment
         prompt = prompts.pop(0)
+        # print(f"prompt: {prompt}")
         out = self._encode(clip, prompt, token_normalization, weight_interpretation)
         # encode and concatenate the rest of the prompt
         for prompt in prompts:
+            # print(f"prompt: {prompt}")
             cond_to = self._encode(clip, prompt, token_normalization, weight_interpretation)
             out = native.ConditioningConcat.concat(self, cond_to[0], out[0])
         return out
-
 
 class MultiModelAdvancedKsampler:
     def __init__(self):
@@ -204,6 +210,7 @@ class MultiModelAdvancedKsampler:
                 "token_normalization": (["none", "mean", "length", "length+mean"],),
                 "weight_interpretation": (["comfy", "A1111", "compel", "comfy++" ,"down_weight"],),
                 "detached_seed": ("BOOLEAN", {"default": False}),
+                "stop_at_step": ("INT", {"default": 0, "min": 0, "max": 100}),
                 "latent_image": ("LATENT",),
             },
             "optional": {
@@ -248,7 +255,7 @@ class MultiModelAdvancedKsampler:
     def serialize_settings(self, **kwargs):
         """Serialize all input parameters into a human-readable string"""
         used_model_count = kwargs.get("used_model_count", 2)
-        
+        print("SERIALIZING NOISE SEED:")
         settings = {
             "used_model_count": used_model_count,
             "ckpt_name1": kwargs.get("ckpt_name1", ""),
@@ -437,6 +444,7 @@ class MultiModelAdvancedKsampler:
             negative = effective_kwargs["negative"]
             lora_name = effective_kwargs["lora_name"]
             noise_seed = effective_kwargs["noise_seed"]
+            print("NOISE SEED", noise_seed)
             rescaled_steps = effective_kwargs["rescaled_steps"]
             rescale_multiplier = effective_kwargs["rescale_multiplier"]
             total_steps_original = effective_kwargs["total_steps_original"]
@@ -452,6 +460,7 @@ class MultiModelAdvancedKsampler:
             steps_shift_third = effective_kwargs.get("steps_shift_third", 0)
             token_normalization = effective_kwargs["token_normalization"]
             weight_interpretation = effective_kwargs["weight_interpretation"]
+            stop_at_step = kwargs.get("stop_at_step", 0)  # Get from direct kwargs, not effective_kwargs
             latent_image = effective_kwargs["latent_image"]
 
             # Determine which checkpoints are being requested
@@ -492,6 +501,9 @@ class MultiModelAdvancedKsampler:
                 # First sampling pass
                 if rescaled_steps > 0:
                     try:
+                        # Adjust rescaled_steps if stop_at_step is set
+                        adjusted_rescaled_steps = min(rescaled_steps, stop_at_step) if stop_at_step > 0 else rescaled_steps
+                        
                         CFGR = comfy_extras.nodes_model_advanced.RescaleCFG()
                         patched_model = CFGR.patch(pipelines[0]['model'], rescale_multiplier)[0]
                         print("Attempting rescaled CFG pass")
@@ -508,10 +520,19 @@ class MultiModelAdvancedKsampler:
                             pipelines[0]['negative_conditioning'], 
                             latent_image, 
                             0, 
-                            rescaled_steps,
+                            adjusted_rescaled_steps,
                             "enable"  # return_with_leftover_noise
                         )
                         print(f"Rescaled CFG pass completed, latent shape: {samples[0]['samples'].shape}")
+                        
+                        # Check if we should stop after rescaled steps
+                        if stop_at_step > 0 and adjusted_rescaled_steps >= stop_at_step:
+                            print(f"Stopping early at step {adjusted_rescaled_steps} due to stop_at_step setting")
+                            settings_str = self.serialize_settings(**effective_kwargs)
+                            return {
+                                "ui": ui_updates,
+                                "result": (samples[0], positive, noise_seed, lora_name, settings_str),
+                            }
                     except Exception as e:
                         print(f"Error in rescaled CFG pass: {str(e)}")
                         raise e
@@ -522,6 +543,12 @@ class MultiModelAdvancedKsampler:
                 # First model's main pass
                 try:
                     actual_steps = rescaled_steps if rescaled_steps > 0 else 0
+                    
+                    # Adjust steps_end_first if stop_at_step is set
+                    adjusted_steps_end_first = steps_end_first
+                    if stop_at_step > 0:
+                        adjusted_steps_end_first = min(steps_end_first, stop_at_step)
+                    
                     samples = KSamplerAdvanced().sample(
                         pipelines[0]['model'],
                         "disable" if rescaled_steps > 0 else "enable",  # add_noise
@@ -534,10 +561,19 @@ class MultiModelAdvancedKsampler:
                         pipelines[0]['negative_conditioning'],
                         samples[0] if rescaled_steps > 0 else latent_image,
                         actual_steps,
-                        steps_end_first,
+                        adjusted_steps_end_first,
                         "enable"  # return_with_leftover_noise
                     )
                     print(f"First model pass completed, latent shape: {samples[0]['samples'].shape}")
+                    
+                    # Check if we should stop after first model
+                    if stop_at_step > 0 and adjusted_steps_end_first >= stop_at_step:
+                        print(f"Stopping early at step {adjusted_steps_end_first} due to stop_at_step setting")
+                        settings_str = self.serialize_settings(**effective_kwargs)
+                        return {
+                            "ui": ui_updates,
+                            "result": (samples[0], positive, noise_seed, lora_name, settings_str),
+                        }
                 except Exception as e:
                     print(f"Error in first model pass: {str(e)}")
                     raise e
@@ -552,6 +588,10 @@ class MultiModelAdvancedKsampler:
                         new_cfg = starting_cfg + cfg_shift
                         model2_start_step = steps_end_first + steps_shift_second
                         new_total_steps = total_steps_original + total_steps_shift_second
+                        
+                        # Adjust end_steps if stop_at_step is set
+                        if stop_at_step > 0:
+                            end_steps = min(end_steps, stop_at_step)
                         
                         samples = KSamplerAdvanced().sample(
                             pipelines[1]['model'],
@@ -569,6 +609,15 @@ class MultiModelAdvancedKsampler:
                             "enable"
                         )
                         print(f"Second model pass completed, latent shape: {samples[0]['samples'].shape}")
+                        
+                        # Check if we should stop after second model
+                        if stop_at_step > 0 and end_steps >= stop_at_step:
+                            print(f"Stopping early at step {end_steps} due to stop_at_step setting")
+                            settings_str = self.serialize_settings(**effective_kwargs)
+                            return {
+                                "ui": ui_updates,
+                                "result": (samples[0], positive, noise_seed, lora_name, settings_str),
+                            }
                     except Exception as e:
                         print(f"Error in second model pass: {str(e)}")
                         raise e
@@ -583,6 +632,11 @@ class MultiModelAdvancedKsampler:
                         new_cfg = starting_cfg + cfg_shift
                         model3_start_step = steps_end_second + steps_shift_third
                         
+                        # Adjust new_total_steps if stop_at_step is set
+                        adjusted_new_total_steps = new_total_steps
+                        if stop_at_step > 0:
+                            adjusted_new_total_steps = min(new_total_steps, stop_at_step)
+                        
                         samples = KSamplerAdvanced().sample(
                             pipelines[2]['model'],
                             "disable",
@@ -595,15 +649,24 @@ class MultiModelAdvancedKsampler:
                             pipelines[2]['negative_conditioning'],
                             samples[0],
                             model3_start_step,
-                            new_total_steps,
+                            adjusted_new_total_steps,
                             "enable"
                         )
                         print(f"Third model pass completed, latent shape: {samples[0]['samples'].shape}")
+                        
+                        # Check if we should stop after third model
+                        if stop_at_step > 0 and adjusted_new_total_steps >= stop_at_step:
+                            print(f"Stopping early at step {adjusted_new_total_steps} due to stop_at_step setting")
+                            settings_str = self.serialize_settings(**effective_kwargs)
+                            return {
+                                "ui": ui_updates,
+                                "result": (samples[0], positive, noise_seed, lora_name, settings_str),
+                            }
                     except Exception as e:
                         print(f"Error in third model pass: {str(e)}")
                         raise e
 
-                # Serialize the settings used for this run
+                # Serialize the settings used for this run (without stop_at_step)
                 settings_str = self.serialize_settings(**effective_kwargs)
                 
                 # Print final memory usage
@@ -632,19 +695,23 @@ class MultiModelAdvancedKsampler:
             self.cleanup()
             raise e
 
-
 class MultiModelPromptSaver:
     def __init__(self):
         self.output_dir = folder_paths.get_output_directory()
         self.type = "output"
         self.prefix_append = ""
+        print("\n[DEBUG] MultiModelPromptSaver initialized")
+        print(f"[DEBUG] Output directory: {self.output_dir}")
 
     @classmethod
     def INPUT_TYPES(s):
+        print("\n[DEBUG] INPUT_TYPES called")
         return {
             "required": {
                 "images": ("IMAGE",),
                 "settings": ("STRING", {"multiline": True}),
+                "seed": ("INT", {"default": 0}),
+                "extension": (["png", "jpg", "jpeg", "webp"], {"default": "png"}),
             },
             "optional": {
                 "filename": (
@@ -652,17 +719,10 @@ class MultiModelPromptSaver:
                     {"default": "ComfyUI_%time_%seed_%counter", "multiline": False},
                 ),
                 "path": ("STRING", {"default": "%date/", "multiline": False}),
-                "extension": (["png", "jpg", "jpeg", "webp"],),
                 "lossless_webp": ("BOOLEAN", {"default": True}),
                 "jpg_webp_quality": ("INT", {"default": 100, "min": 1, "max": 100}),
-                "date_format": (
-                    "STRING",
-                    {"default": "%Y-%m-%d", "multiline": False},
-                ),
-                "time_format": (
-                    "STRING",
-                    {"default": "%H%M%S", "multiline": False},
-                ),
+                "date_format": ("STRING", {"default": "%Y-%m-%d", "multiline": False}),
+                "time_format": ("STRING", {"default": "%H%M%S", "multiline": False}),
                 "save_metadata_file": ("BOOLEAN", {"default": False}),
             },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
@@ -674,63 +734,83 @@ class MultiModelPromptSaver:
     OUTPUT_NODE = True
     CATEGORY = "SD Prompt Reader"
 
-    def save_images(
-        self,
-        images,
-        settings: str,
-        filename: str = "ComfyUI_%time_%seed_%counter",
-        path: str = "%date/",
-        extension: str = "png",
-        lossless_webp: bool = True,
-        jpg_webp_quality: int = 100,
-        date_format: str = "%Y-%m-%d",
-        time_format: str = "%H%M%S",
-        save_metadata_file: bool = False,
-        prompt=None,
-        extra_pnginfo=None,
-    ):
-        (
-            full_output_folder,
-            filename_alt,
-            counter_alt,
-            subfolder_alt,
-            filename_prefix,
-        ) = folder_paths.get_save_image_path(
-            self.prefix_append,
-            self.output_dir,
-            images[0].shape[1],
-            images[0].shape[0],
-        )
+    def save_images(self, images, settings, **kwargs):
+        print("\n[DEBUG] save_images called with kwargs:")
+        for k, v in kwargs.items():
+            print(f"  {k}: {v} (type: {type(v)})")
+        
+        # Extract all parameters with defaults
+        seed = kwargs.get('seed', 0)
+        extension = kwargs.get('extension', 'png')
+        filename = kwargs.get('filename', 'ComfyUI_%time_%seed_%counter')
+        path = kwargs.get('path', '%date/')
+        lossless_webp = kwargs.get('lossless_webp', True)
+        jpg_webp_quality = kwargs.get('jpg_webp_quality', 100)
+        date_format = kwargs.get('date_format', '%Y-%m-%d')
+        time_format = kwargs.get('time_format', '%H%M%S')
+        save_metadata_file = kwargs.get('save_metadata_file', False)
+        prompt = kwargs.get('prompt', None)
+        extra_pnginfo = kwargs.get('extra_pnginfo', None)
+
+        print("\n[DEBUG] Processed parameters:")
+        print(f"  seed: {seed}")
+        print(f"  extension: {extension}")
+        print(f"  filename template: {filename}")
+        print(f"  path template: {path}")
+        print(f"  jpg_webp_quality: {jpg_webp_quality}")
+
+        try:
+            full_output_folder = folder_paths.get_save_image_path(
+                self.prefix_append,
+                self.output_dir,
+                images[0].shape[1],
+                images[0].shape[0]
+            )
+            print(f"\n[DEBUG] full_output_folder: {full_output_folder}")
+        except Exception as e:
+            print(f"\n[ERROR] Failed to get save path: {str(e)}")
+            raise
 
         results = []
         files = []
         file_paths = []
         comments = []
         
-        for image in images:
+        for i, image in enumerate(images):
+            print(f"\n[DEBUG] Processing image {i+1}/{len(images)}")
+            
             variable_map = {
                 "%date": self.get_time(date_format),
                 "%time": self.get_time(time_format),
+                "%seed": str(seed),
                 "%extension": extension,
-                "%quality": jpg_webp_quality,
             }
+            print(f"[DEBUG] variable_map: {variable_map}")
 
-            subfolder = self.get_path(path, variable_map)
-            output_folder = Path(full_output_folder) / subfolder
-            output_folder.mkdir(parents=True, exist_ok=True)
-            counter = self.get_counter(output_folder)
-            variable_map["%counter"] = f"{counter:05}"
+            try:
+                subfolder = self.get_path(path, variable_map)
+                output_folder = Path(full_output_folder[0]) / subfolder
+                print(f"[DEBUG] output_folder: {output_folder}")
+                
+                output_folder.mkdir(parents=True, exist_ok=True)
+                counter = self.get_counter(output_folder)
+                variable_map["%counter"] = f"{counter:05}"
+                print(f"[DEBUG] counter: {counter}")
 
-            i = 255.0 * image.cpu().numpy()
-            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
-            metadata = None
+                # Convert image
+                img_array = 255.0 * image.cpu().numpy()
+                img = Image.fromarray(np.clip(img_array, 0, 255).astype(np.uint8))
+                
+                # Generate filename
+                stem = self.get_path(filename, variable_map)
+                print(f"[DEBUG] stem before unique: {stem}")
+                file = self.get_unique_filename(stem, extension, output_folder)
+                file_path = output_folder / file
+                print(f"[DEBUG] Final file_path: {file_path}")
 
-            stem = self.get_path(filename, variable_map)
-            file = self.get_unique_filename(stem, extension, output_folder)
-            file_path = output_folder / file
-
-            if extension == "png":
-                if not args.disable_metadata:
+                # Save image
+                if extension == "png":
+                    print("[DEBUG] Saving as PNG")
                     metadata = PngInfo()
                     metadata.add_text("parameters", settings)
                     if prompt is not None:
@@ -738,39 +818,35 @@ class MultiModelPromptSaver:
                     if extra_pnginfo is not None:
                         for x in extra_pnginfo:
                             metadata.add_text(x, json.dumps(extra_pnginfo[x]))
-                img.save(
-                    file_path,
-                    pnginfo=metadata,
-                    compress_level=4,
-                )
-            else:
-                img.save(
-                    file_path,
-                    quality=jpg_webp_quality,
-                    lossless=lossless_webp,
-                )
-                if not args.disable_metadata:
-                    metadata = piexif.dump(
-                        {
-                            "Exif": {
-                                piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(
-                                    settings, encoding="unicode"
-                                )
-                            },
-                        }
+                    img.save(file_path, pnginfo=metadata, compress_level=4)
+                else:
+                    print(f"[DEBUG] Saving as {extension.upper()} with quality {jpg_webp_quality}")
+                    img.save(
+                        file_path,
+                        quality=jpg_webp_quality,
+                        lossless=lossless_webp,
                     )
-                    piexif.insert(metadata, str(file_path))
 
-            if save_metadata_file:
-                with open(file_path.with_suffix(".txt"), "w", encoding="utf-8") as f:
-                    f.write(settings)
+                if save_metadata_file:
+                    metadata_path = file_path.with_suffix(".txt")
+                    print(f"[DEBUG] Saving metadata to {metadata_path}")
+                    with open(metadata_path, "w", encoding="utf-8") as f:
+                        f.write(settings)
 
-            results.append(
-                {"filename": file.name, "subfolder": str(subfolder), "type": self.type}
-            )
-            files.append(str(file))
-            file_paths.append(str(file_path))
-            comments.append(settings)
+                results.append({"filename": file.name, "subfolder": str(subfolder), "type": self.type})
+                files.append(str(file))
+                file_paths.append(str(file_path))
+                comments.append(settings)
+
+            except Exception as e:
+                print(f"\n[ERROR] Failed to process image {i+1}: {str(e)}")
+                raise
+
+        # Debug return values
+        print("\n[DEBUG] Returning values:")
+        print(f"  FILENAME: {files[0] if len(files) == 1 else files}")
+        print(f"  FILE_PATH: {file_paths[0] if len(file_paths) == 1 else file_paths}")
+        print(f"  METADATA: {comments[0] if len(comments) == 1 else comments}")
 
         return {
             "ui": {"images": results},
@@ -783,9 +859,7 @@ class MultiModelPromptSaver:
 
     @staticmethod
     def get_counter(directory: Path):
-        img_files = list(
-            chain(*(directory.rglob(f"*{suffix}") for suffix in SUPPORTED_FORMATS))
-        )
+        img_files = list(chain(*(directory.rglob(f"*{suffix}") for suffix in SUPPORTED_FORMATS)))
         return len(img_files) + 1
 
     @staticmethod
@@ -798,21 +872,27 @@ class MultiModelPromptSaver:
     def get_time(time_format):
         now = datetime.now()
         try:
-            time_str = now.strftime(time_format)
-            return time_str
+            return now.strftime(time_format)
         except:
             return ""
 
     @staticmethod
     def get_unique_filename(stem: Path, extension: str, output_folder: Path):
-        file = stem.with_suffix(f"{stem.suffix}.{extension}")
+        print(f"\n[DEBUG] get_unique_filename input:")
+        print(f"  stem: {stem}")
+        print(f"  extension: {extension}")
+        print(f"  output_folder: {output_folder}")
+        
+        file = stem.with_suffix(f".{extension}")
         index = 0
+        print(f"  initial file attempt: {file}")
 
         while (output_folder / file).exists():
             index += 1
-            new_stem = Path(f"{stem}_{index}")
-            file = new_stem.with_suffix(f"{new_stem.suffix}.{extension}")
+            file = stem.with_name(f"{stem.name}_{index}.{extension}")
+            print(f"  conflict found, trying: {file}")
 
+        print(f"[DEBUG] Final unique filename: {file}")
         return file
 
     @staticmethod
