@@ -22,6 +22,7 @@ import psutil
 import hashlib
 
 import re
+import gc
 import nodes as native
 from .adv_encode import advanced_encode #, advanced_encode_XL
 
@@ -61,7 +62,7 @@ sys.path.append(custom_nodes_dir)
 
 class LoraTagLoader:
     def __init__(self):
-        self.loaded_loras = {}  # Changed from single loaded_lora to dictionary
+        self.loaded_lora = None
         self.tag_pattern = "\<[0-9a-zA-Z\:\_\-\.\s\/\(\)\\\\]+\>"
 
     @classmethod
@@ -76,14 +77,11 @@ class LoraTagLoader:
 
     CATEGORY = "loaders"
 
-    def cleanup(self):
-        """Clean up all loaded LoRA weights"""
-        print("Performing LoRA cleanup")
-        self.loaded_loras = {}
-        comfy.model_management.soft_empty_cache()
-
     def load_lora(self, model, clip, text):
+        # print(f"\nLoraTagLoader input text: { text }")
+
         founds = re.findall(self.tag_pattern, text)
+        # print(f"\nfoound lora tags: { founds }")
 
         if len(founds) < 1:
             return (model, clip, text)
@@ -91,23 +89,18 @@ class LoraTagLoader:
         model_lora = model
         clip_lora = clip
         
-        # Track which LoRAs we're using this run
-        current_loras = set()
         lora_files = folder_paths.get_filename_list("loras")
-        
         for f in founds:
             tag = f[1:-1]
             pak = tag.split(":")
             type = pak[0]
             if type != 'lora':
                 continue
-                
             name = None
             if len(pak) > 1 and len(pak[1]) > 0:
                 name = pak[1]
             else:
                 continue
-                
             wModel = wClip = 0
             try:
                 if len(pak) > 2 and len(pak[2]) > 0:
@@ -117,43 +110,37 @@ class LoraTagLoader:
                     wClip = float(pak[3])
             except ValueError:
                 continue
-                
-            if name is None:
+            if name == None:
                 continue
-                
             lora_name = None
             for lora_file in lora_files:
                 if Path(lora_file).name.startswith(name) or lora_file.startswith(name):
                     lora_name = lora_file
                     break
-                    
-            if lora_name is None:
+            if lora_name == None:
                 print(f"bypassed lora tag: { (type, name, wModel, wClip) } >> { lora_name }")
                 continue
-                
             print(f"detected lora tag: { (type, name, wModel, wClip) } >> { lora_name }")
+
             lora_path = folder_paths.get_full_path("loras", lora_name)
-            current_loras.add(lora_path)
-            
-            # Check if we already have this LoRA loaded
-            lora = self.loaded_loras.get(lora_path)
-            
+            lora = None
+            if self.loaded_lora is not None:
+                if self.loaded_lora[0] == lora_path:
+                    lora = self.loaded_lora[1]
+                else:
+                    temp = self.loaded_lora
+                    self.loaded_lora = None
+                    del temp
+
             if lora is None:
-                # Load new LoRA
                 lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
-                self.loaded_loras[lora_path] = lora
-                
-            # Apply LoRA to model
+                self.loaded_lora = (lora_path, lora)
+
             model_lora, clip_lora = comfy.sd.load_lora_for_models(model_lora, clip_lora, lora, wModel, wClip)
-        
-        # Clean up any LoRAs not used in this run
-        to_remove = [path for path in self.loaded_loras if path not in current_loras]
-        for path in to_remove:
-            print(f"Purging unused LoRA: {path}")
-            del self.loaded_loras[path]
-            
+
         plain_prompt = re.sub(self.tag_pattern, "", text)
         return (model_lora, clip_lora, plain_prompt)
+
 
 class AdvancedCLIPTextEncodeWithBreak:
 
@@ -187,8 +174,16 @@ class AdvancedCLIPTextEncodeWithBreak:
             cond_to = self._encode(clip, prompt, token_normalization, weight_interpretation)
             out = native.ConditioningConcat.concat(self, cond_to[0], out[0])
         return out
-        
+
+
 class MultiModelCheckpointIteratorFirst:
+    def __init__(self):
+        self.loaded_checkpoints = {}  # Dictionary to store loaded checkpoints by name
+        self.loaded_loras = {}        # Dictionary to store loaded LoRAs by path
+        self.current_checkpoints = set()  # Track currently requested checkpoints
+        self.ckpt_name1_index = 0    # Index for cycling through first model checkpoints
+        self.ckpt_name1_list = []    # List of first model checkpoints
+        
     @classmethod 
     def INPUT_TYPES(s):
         return {
@@ -218,6 +213,7 @@ class MultiModelCheckpointIteratorFirst:
                 "weight_interpretation": (["comfy", "A1111", "compel", "comfy++" ,"down_weight"],),
                 "detached_seed": ("BOOLEAN", {"default": False}),
                 "detached_checkpoint": ("BOOLEAN", {"default": False}),
+                "stop_at_step": ("INT", {"default": 0, "min": 0, "max": 100}),
                 "latent_image": ("LATENT",),
             },
             "optional": {
@@ -225,23 +221,41 @@ class MultiModelCheckpointIteratorFirst:
             }
         }
 
-    RETURN_TYPES = ("LATENT", "STRING")
-    RETURN_NAMES = ("LATENT", "settings")
+    RETURN_TYPES = ("LATENT", "STRING", "INT", "STRING", "STRING", "STRING")  # Added 6th output
+    RETURN_NAMES = ("LATENT", "prompt", "seed", "lora", "settings", "used_ckpt_name")  # New output
     FUNCTION = "sample"
     CATEGORY = "sampling"
     
-    def __init__(self):
-        self.loaded_checkpoints = {}  # Dictionary to store loaded checkpoints by name
-        self.current_checkpoints = set()  # Track currently requested checkpoints
-        self.ckpt_name1_index = 0  # Index for cycling through first model checkpoints
-        self.ckpt_name1_list = []  # List of first model checkpoints
+    def print_memory_usage(self):
+        process = psutil.Process(os.getpid())
+        print(f"Memory usage: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+        print(f"Loaded checkpoints: {len(self.loaded_checkpoints)}")
+        print(f"Loaded LoRAs: {len(self.loaded_loras)}")
         
     def cleanup(self):
         """Force cleanup of all resources"""
-        print("Performing cleanup of loaded checkpoints")
+        print("Performing full cleanup of loaded models and LoRAs")
+        
+        # Clear checkpoints
+        for name, (model, clip, vae) in self.loaded_checkpoints.items():
+            del model
+            del clip
+            del vae
         self.loaded_checkpoints = {}
+        
+        # Clear LoRAs
+        for path, lora in self.loaded_loras.items():
+            del lora
+        self.loaded_loras = {}
+        
         self.current_checkpoints = set()
-        comfy.model_management.soft_empty_cache()        
+        self.ckpt_name1_index = 0
+        self.ckpt_name1_list = []
+        
+        # Force garbage collection
+        gc.collect()
+        comfy.model_management.soft_empty_cache()
+        self.print_memory_usage()
         
     def serialize_settings(self, **kwargs):
         """Serialize all input parameters into a human-readable string"""
@@ -300,39 +314,41 @@ class MultiModelCheckpointIteratorFirst:
             if loaded:
                 # Create a new kwargs with loaded settings, but keep original latent_image
                 effective_kwargs = loaded.copy()
-                effective_kwargs["latent_image"] = kwargs["latent_image"]
+                if "latent_image" in kwargs:
+                    effective_kwargs["latent_image"] = kwargs["latent_image"]
                 
                 # If detached_seed is True, override the seed from direct input
-                if detached_seed:
+                if detached_seed and "noise_seed" in kwargs:
                     effective_kwargs["noise_seed"] = kwargs["noise_seed"]
                 
+                # Process checkpoint list if provided
                 ckpt_name1_list = kwargs.get("ckpt_name1_list", "")
                 if ckpt_name1_list:
                     # Split the list by line breaks and clean up each entry
                     self.ckpt_name1_list = [name.strip() for name in ckpt_name1_list.split('\n') if name.strip()]
                     
                     # If we have a list, select the next checkpoint in sequence
-                    if self.ckpt_name1_list and detached_checkpoint == True:
+                    if self.ckpt_name1_list and detached_checkpoint:
                         print("detached checkpoint is ON")
                         effective_kwargs["ckpt_name1"] = self.ckpt_name1_list[self.ckpt_name1_index % len(self.ckpt_name1_list)]
                         self.ckpt_name1_index += 1  # Increment for next run
                     
-            return effective_kwargs
-        else:
-            # Process the ckpt_name1_list when not loading settings
-            ckpt_name1_list = kwargs.get("ckpt_name1_list", "")
-            if ckpt_name1_list:
-                # Split the list by line breaks and clean up each entry
-                self.ckpt_name1_list = [name.strip() for name in ckpt_name1_list.split('\n') if name.strip()]
-                
-                # If we have a list, select the next checkpoint in sequence
-                if self.ckpt_name1_list:
-                    kwargs["ckpt_name1"] = self.ckpt_name1_list[self.ckpt_name1_index % len(self.ckpt_name1_list)]
-                    self.ckpt_name1_index += 1  # Increment for next run
-            else:
-                kwargs["ckpt_name1"] = ""
+                return effective_kwargs
+        
+        # Process checkpoint list when not loading settings
+        ckpt_name1_list = kwargs.get("ckpt_name1_list", "")
+        if ckpt_name1_list:
+            # Split the list by line breaks and clean up each entry
+            self.ckpt_name1_list = [name.strip() for name in ckpt_name1_list.split('\n') if name.strip()]
             
-            return kwargs
+            # If we have a list, select the next checkpoint in sequence
+            if self.ckpt_name1_list:
+                kwargs["ckpt_name1"] = self.ckpt_name1_list[self.ckpt_name1_index % len(self.ckpt_name1_list)]
+                self.ckpt_name1_index += 1  # Increment for next run
+        else:
+            kwargs["ckpt_name1"] = ""
+        
+        return kwargs
     
     def purge_unused_checkpoints(self, requested_checkpoints):
         """Purges checkpoints that aren't in the current request"""
@@ -346,6 +362,10 @@ class MultiModelCheckpointIteratorFirst:
         # Purge unused checkpoints
         for name in to_remove:
             print(f"Purging unused checkpoint: {name}")
+            model, clip, vae = self.loaded_checkpoints[name]
+            del model
+            del clip
+            del vae
             del self.loaded_checkpoints[name]
         
         # Update current checkpoints
@@ -354,6 +374,8 @@ class MultiModelCheckpointIteratorFirst:
     def load_model_pipeline(self, ckpt_name, lora_name, positive, negative,
                           token_normalization, weight_interpretation):
         """Helper function to load a complete model pipeline"""
+        self.print_memory_usage()
+        
         # Check if we already have this checkpoint loaded
         if ckpt_name in self.loaded_checkpoints:
             model, clip, vae = self.loaded_checkpoints[ckpt_name]
@@ -372,7 +394,14 @@ class MultiModelCheckpointIteratorFirst:
         
         # Apply LoRA if specified
         if lora_name and lora_name.strip():
-            model, clip, _ = LoraTagLoader().load_lora(model, clip, lora_name)
+            # Create a new LoraTagLoader instance for each call
+            lora_loader = LoraTagLoader()
+            model, clip, _ = lora_loader.load_lora(model, clip, lora_name)
+            
+            # Store the loaded LoRA reference if the loader has one
+            if lora_loader.loaded_lora is not None:
+                lora_path, lora = lora_loader.loaded_lora
+                self.loaded_loras[lora_path] = lora
         
         # Generate conditioning
         positive_conditioning = AdvancedCLIPTextEncodeWithBreak().encode(
@@ -393,10 +422,14 @@ class MultiModelCheckpointIteratorFirst:
 
     def sample(self, **kwargs):
         try:
+            # Print initial memory usage
+            self.print_memory_usage()
+            
             # Get effective settings (either from load_settings or direct inputs)
             effective_kwargs = self.get_effective_settings(**kwargs)
+            
             if effective_kwargs is None:
-                effective_kwargs = kwargs
+                effective_kwargs = kwargs.copy()
             
             load_settings = kwargs.get("load_settings", "")
             
@@ -439,6 +472,8 @@ class MultiModelCheckpointIteratorFirst:
             # Extract all parameters from effective_kwargs
             used_model_count = effective_kwargs["used_model_count"]
             ckpt_name1 = effective_kwargs["ckpt_name1"]
+            used_ckpt_name = effective_kwargs["ckpt_name1"]  # The actual checkpoint used
+            used_ckpt_short = os.path.splitext(os.path.basename(used_ckpt_name))[0]  # Cleaned name only
             ckpt_name2 = effective_kwargs.get("ckpt_name2", "")
             ckpt_name3 = effective_kwargs.get("ckpt_name3", "")
             positive = effective_kwargs["positive"]
@@ -460,6 +495,7 @@ class MultiModelCheckpointIteratorFirst:
             steps_shift_third = effective_kwargs.get("steps_shift_third", 0)
             token_normalization = effective_kwargs["token_normalization"]
             weight_interpretation = effective_kwargs["weight_interpretation"]
+            stop_at_step = kwargs.get("stop_at_step", 0)  # Get from direct kwargs, not effective_kwargs
             latent_image = effective_kwargs["latent_image"]
 
             # Determine which checkpoints are being requested
@@ -500,6 +536,9 @@ class MultiModelCheckpointIteratorFirst:
                 # First sampling pass
                 if rescaled_steps > 0:
                     try:
+                        # Adjust rescaled_steps if stop_at_step is set
+                        adjusted_rescaled_steps = min(rescaled_steps, stop_at_step) if stop_at_step > 0 else rescaled_steps
+                        
                         CFGR = comfy_extras.nodes_model_advanced.RescaleCFG()
                         patched_model = CFGR.patch(pipelines[0]['model'], rescale_multiplier)[0]
                         print("Attempting rescaled CFG pass")
@@ -516,10 +555,19 @@ class MultiModelCheckpointIteratorFirst:
                             pipelines[0]['negative_conditioning'], 
                             latent_image, 
                             0, 
-                            rescaled_steps,
+                            adjusted_rescaled_steps,
                             "enable"  # return_with_leftover_noise
                         )
                         print(f"Rescaled CFG pass completed, latent shape: {samples[0]['samples'].shape}")
+                        
+                        # Check if we should stop after rescaled steps
+                        if stop_at_step > 0 and adjusted_rescaled_steps >= stop_at_step:
+                            print(f"Stopping early at step {adjusted_rescaled_steps} due to stop_at_step setting")
+                            settings_str = self.serialize_settings(**effective_kwargs)
+                            return {
+                                "ui": ui_updates,
+                                "result": (samples[0], positive, noise_seed, lora_name, settings_str),
+                            }
                     except Exception as e:
                         print(f"Error in rescaled CFG pass: {str(e)}")
                         raise e
@@ -530,6 +578,12 @@ class MultiModelCheckpointIteratorFirst:
                 # First model's main pass
                 try:
                     actual_steps = rescaled_steps if rescaled_steps > 0 else 0
+                    
+                    # Adjust steps_end_first if stop_at_step is set
+                    adjusted_steps_end_first = steps_end_first
+                    if stop_at_step > 0:
+                        adjusted_steps_end_first = min(steps_end_first, stop_at_step)
+                    
                     samples = KSamplerAdvanced().sample(
                         pipelines[0]['model'],
                         "disable" if rescaled_steps > 0 else "enable",  # add_noise
@@ -542,10 +596,19 @@ class MultiModelCheckpointIteratorFirst:
                         pipelines[0]['negative_conditioning'],
                         samples[0] if rescaled_steps > 0 else latent_image,
                         actual_steps,
-                        steps_end_first,
+                        adjusted_steps_end_first,
                         "enable"  # return_with_leftover_noise
                     )
                     print(f"First model pass completed, latent shape: {samples[0]['samples'].shape}")
+                    
+                    # Check if we should stop after first model
+                    if stop_at_step > 0 and adjusted_steps_end_first >= stop_at_step:
+                        print(f"Stopping early at step {adjusted_steps_end_first} due to stop_at_step setting")
+                        settings_str = self.serialize_settings(**effective_kwargs)
+                        return {
+                            "ui": ui_updates,
+                            "result": (samples[0], positive, noise_seed, lora_name, settings_str),
+                        }
                 except Exception as e:
                     print(f"Error in first model pass: {str(e)}")
                     raise e
@@ -560,6 +623,10 @@ class MultiModelCheckpointIteratorFirst:
                         new_cfg = starting_cfg + cfg_shift
                         model2_start_step = steps_end_first + steps_shift_second
                         new_total_steps = total_steps_original + total_steps_shift_second
+                        
+                        # Adjust end_steps if stop_at_step is set
+                        if stop_at_step > 0:
+                            end_steps = min(end_steps, stop_at_step)
                         
                         samples = KSamplerAdvanced().sample(
                             pipelines[1]['model'],
@@ -577,6 +644,15 @@ class MultiModelCheckpointIteratorFirst:
                             "enable"
                         )
                         print(f"Second model pass completed, latent shape: {samples[0]['samples'].shape}")
+                        
+                        # Check if we should stop after second model
+                        if stop_at_step > 0 and end_steps >= stop_at_step:
+                            print(f"Stopping early at step {end_steps} due to stop_at_step setting")
+                            settings_str = self.serialize_settings(**effective_kwargs)
+                            return {
+                                "ui": ui_updates,
+                                "result": (samples[0], positive, noise_seed, lora_name, settings_str),
+                            }
                     except Exception as e:
                         print(f"Error in second model pass: {str(e)}")
                         raise e
@@ -591,6 +667,11 @@ class MultiModelCheckpointIteratorFirst:
                         new_cfg = starting_cfg + cfg_shift
                         model3_start_step = steps_end_second + steps_shift_third
                         
+                        # Adjust new_total_steps if stop_at_step is set
+                        adjusted_new_total_steps = new_total_steps
+                        if stop_at_step > 0:
+                            adjusted_new_total_steps = min(new_total_steps, stop_at_step)
+                        
                         samples = KSamplerAdvanced().sample(
                             pipelines[2]['model'],
                             "disable",
@@ -603,20 +684,39 @@ class MultiModelCheckpointIteratorFirst:
                             pipelines[2]['negative_conditioning'],
                             samples[0],
                             model3_start_step,
-                            new_total_steps,
+                            adjusted_new_total_steps,
                             "enable"
                         )
                         print(f"Third model pass completed, latent shape: {samples[0]['samples'].shape}")
+                        
+                        # Check if we should stop after third model
+                        if stop_at_step > 0 and adjusted_new_total_steps >= stop_at_step:
+                            print(f"Stopping early at step {adjusted_new_total_steps} due to stop_at_step setting")
+                            settings_str = self.serialize_settings(**effective_kwargs)
+                            return {
+                                "ui": ui_updates,
+                                "result": (samples[0], positive, noise_seed, lora_name, settings_str),
+                            }
                     except Exception as e:
                         print(f"Error in third model pass: {str(e)}")
                         raise e
 
-                # Serialize the settings used for this run
+                # Serialize the settings used for this run (without stop_at_step)
                 settings_str = self.serialize_settings(**effective_kwargs)
+                
+                # Print final memory usage
+                self.print_memory_usage()
                 
                 return {
                     "ui": ui_updates,
-                    "result": (samples[0], settings_str),
+                    "result": (
+                        samples[0], 
+                        positive, 
+                        noise_seed, 
+                        lora_name, 
+                        settings_str,
+                        used_ckpt_short  # New: exposes the actual checkpoint used
+                    ),
                 }
                 
             except Exception as e:
@@ -625,7 +725,7 @@ class MultiModelCheckpointIteratorFirst:
                     print("Processing was interrupted, cleaned up resources")
                     return {
                         "ui": ui_updates,
-                        "result": (latent_image, ""),
+                        "result": (latent_image, "", 0, "", ""),
                     }
                 else:
                     print(f"Error during sampling: {str(e)}")
@@ -636,253 +736,3 @@ class MultiModelCheckpointIteratorFirst:
         except Exception as e:
             self.cleanup()
             raise e
-            
-
-class MultiModelPromptSaverIterative:
-    def __init__(self):
-        self.output_dir = folder_paths.get_output_directory()
-        self.type = "output"
-        self.prefix_append = ""
-        self.ckpt_cache = {}  # Cache for checkpoint names
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "images": ("IMAGE",),
-                "settings": ("STRING", {"multiline": True}),
-            },
-            "optional": {
-                "filename": (
-                    "STRING",
-                    {"default": "ComfyUI_%time_%seed_%counter_%ckpt", "multiline": False},
-                ),
-                "path": ("STRING", {"default": "%date/%ckpt", "multiline": False}),
-                "extension": (["png", "jpg", "jpeg", "webp"],),
-                "lossless_webp": ("BOOLEAN", {"default": True}),
-                "jpg_webp_quality": ("INT", {"default": 100, "min": 1, "max": 100}),
-                "date_format": (
-                    "STRING",
-                    {"default": "%Y-%m-%d", "multiline": False},
-                ),
-                "time_format": (
-                    "STRING",
-                    {"default": "%H%M%S", "multiline": False},
-                ),
-                "save_metadata_file": ("BOOLEAN", {"default": False}),
-            },
-            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
-        }
-
-    RETURN_TYPES = ("STRING", "STRING", "STRING")
-    RETURN_NAMES = ("FILENAME", "FILE_PATH", "METADATA")
-    FUNCTION = "save_images"
-    OUTPUT_NODE = True
-    CATEGORY = "SD Prompt Reader"
-
-    def save_images(
-        self,
-        images,
-        settings: str,
-        filename: str = "ComfyUI_%time_%seed_%counter_%ckpt",
-        path: str = "%date/%ckpt",
-        extension: str = "png",
-        lossless_webp: bool = True,
-        jpg_webp_quality: int = 100,
-        date_format: str = "%Y-%m-%d",
-        time_format: str = "%H%M%S",
-        save_metadata_file: bool = False,
-        prompt=None,
-        extra_pnginfo=None,
-    ):
-        # Get or generate cache key for settings
-        settings_hash = hashlib.md5(settings.encode()).hexdigest()
-        
-        # Check cache first
-        if settings_hash in self.ckpt_cache:
-            ckpt_name = self.ckpt_cache[settings_hash]
-        else:
-            ckpt_name = self.extract_checkpoint_name(settings)
-            self.ckpt_cache[settings_hash] = ckpt_name
-
-        # Prepare variable substitutions
-        variable_map = {
-            "%date": self.get_time(date_format),
-            "%time": self.get_time(time_format),
-            "%extension": extension,
-            "%quality": jpg_webp_quality,
-            "%ckpt": ckpt_name or "unknown_model",
-        }
-
-        # Get output paths
-        full_output_folder = folder_paths.get_output_directory()
-        subfolder = self.get_path(path, variable_map)
-        output_folder = Path(full_output_folder) / subfolder
-        output_folder.mkdir(parents=True, exist_ok=True)
-        
-        # Process images
-        results = []
-        files = []
-        file_paths = []
-        
-        for image in images:
-            # Update counter for each image
-            counter = self.get_counter(output_folder)
-            variable_map["%counter"] = f"{counter:05}"
-            
-            # Generate filename
-            stem = self.get_path(filename, variable_map)
-            file = self.get_unique_filename(stem, extension, output_folder)
-            file_path = output_folder / file
-
-            # Convert and save image
-            img = self.tensor_to_image(image)
-            self.save_image_with_metadata(
-                img, 
-                file_path, 
-                extension, 
-                settings, 
-                prompt, 
-                extra_pnginfo,
-                lossless_webp,
-                jpg_webp_quality
-            )
-
-            # Save metadata file if requested
-            if save_metadata_file:
-                self.save_metadata_file(file_path, settings)
-
-            # Store results
-            results.append({
-                "filename": file.name, 
-                "subfolder": str(subfolder), 
-                "type": self.type
-            })
-            files.append(str(file))
-            file_paths.append(str(file_path))
-
-        return {
-            "ui": {"images": results},
-            "result": (
-                self.unpack_singleton(files),
-                self.unpack_singleton(file_paths),
-                settings,  # Return original settings as metadata
-            ),
-        }
-
-    def extract_checkpoint_name(self, settings_str: str) -> str:
-        """Robust checkpoint name extraction from settings string"""
-        if not settings_str.strip():
-            return ""
-
-        try:
-            # First try direct JSON parse
-            try:
-                settings = json.loads(settings_str)
-            except json.JSONDecodeError:
-                # Handle cases where settings might be wrapped in metadata
-                if settings_str.startswith('{"parameters":'):
-                    settings = json.loads(settings_str)
-                    settings_str = settings.get("parameters", "")
-                    settings = json.loads(settings_str)
-                else:
-                    return ""
-
-            # Try to find checkpoint names in various locations
-            ckpt_name = (
-                settings.get("ckpt_name2") or 
-                settings.get("ckpt_name1") or 
-                ""
-            )
-
-            # Clean up the name
-            if ckpt_name:
-                ckpt_name = Path(ckpt_name).stem
-                ckpt_name = re.sub(r'[\\/:*?"<>|\s]', '_', ckpt_name)
-                ckpt_name = re.sub(r'_{2,}', '_', ckpt_name).strip('_')
-                return ckpt_name[:64]  # Limit length
-            
-            return ""
-        except Exception as e:
-            print(f"Error extracting checkpoint: {str(e)}")
-            return ""
-
-    def tensor_to_image(self, tensor):
-        """Convert torch tensor to PIL Image"""
-        i = 255.0 * tensor.cpu().numpy()
-        return Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
-
-    def save_image_with_metadata(
-        self, 
-        img, 
-        file_path, 
-        extension, 
-        settings, 
-        prompt, 
-        extra_pnginfo,
-        lossless_webp,
-        quality
-    ):
-        """Save image with appropriate metadata"""
-        if extension == "png":
-            metadata = PngInfo()
-            if not args.disable_metadata:
-                metadata.add_text("parameters", settings)
-                if prompt is not None:
-                    metadata.add_text("prompt", json.dumps(prompt))
-                if extra_pnginfo is not None:
-                    for x in extra_pnginfo:
-                        metadata.add_text(x, json.dumps(extra_pnginfo[x]))
-            img.save(file_path, pnginfo=metadata, compress_level=4)
-        else:
-            img.save(file_path, quality=quality, lossless=lossless_webp)
-            if not args.disable_metadata:
-                metadata = piexif.dump({
-                    "Exif": {
-                        piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(
-                            settings, encoding="unicode"
-                        )
-                    },
-                })
-                piexif.insert(metadata, str(file_path))
-
-    def save_metadata_file(self, file_path, settings):
-        """Save metadata to separate text file"""
-        with open(file_path.with_suffix(".txt"), "w", encoding="utf-8") as f:
-            f.write(settings)
-
-    @staticmethod
-    def get_counter(directory: Path):
-        """Get next counter value for directory"""
-        existing = list(directory.glob("*"))
-        return len(existing) + 1
-
-    @staticmethod
-    def get_path(name, variable_map):
-        """Apply variable substitutions to path/filename"""
-        for var, val in variable_map.items():
-            name = name.replace(var, str(val))
-        return Path(name)
-
-    @staticmethod
-    def get_time(time_format):
-        """Get formatted time string"""
-        try:
-            return datetime.now().strftime(time_format)
-        except:
-            return ""
-
-    @staticmethod
-    def get_unique_filename(stem: Path, extension: str, output_folder: Path):
-        """Generate unique filename by appending index if needed"""
-        file = stem.with_suffix(f".{extension}")
-        index = 0
-        while (output_folder / file).exists():
-            index += 1
-            file = stem.with_name(f"{stem.name}_{index}").with_suffix(f".{extension}")
-        return file
-
-    @staticmethod
-    def unpack_singleton(arr: list):
-        """Return single item or full list"""
-        return arr[0] if len(arr) == 1 else arr

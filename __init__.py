@@ -30,9 +30,7 @@ NODE_CLASS_MAPPINGS = {
     "MultiModelAdvancedKsampler": MultiModelAdvancedKsampler,
     "MultiModelCheckpointIterator": MultiModelCheckpointIterator,
     "MultiModelPromptSaver": MultiModelPromptSaver,
-    "MultiModelPromptSaverIterative": MultiModelPromptSaverIterative,
-    "MultiModelPromptSaverIterativeFirst": MultiModelCheckpointIteratorFirst,
-    "MultiModelPromptSaverIterativeFirst": MultiModelCheckpointIteratorFirst,
+    "MultiModelCheckpointIteratorFirst": MultiModelCheckpointIteratorFirst,
     
 }
 
@@ -49,9 +47,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Ranbooru": "Danbooru",
     "MultiModelAdvancedKsampler": "MultiModelAdvancedKsampler",
     "MultiModelCheckpointIterator": "MultiModelCheckpointIterator",
+    "MultiModelCheckpointIteratorFirst": "MultiModelCheckpointIteratorFirst",
     "MultiModelPromptSaver": "MultiModelPromptSaver",
-    "MultiModelPromptSaverIterative": "MultiModelPromptSaverIterative",
-    "MultiModelPromptSaverIterativeFirst": "MultiModelPromptSaverIterativeFirst"
 }
 
 __all__ = NODE_CLASS_MAPPINGS
