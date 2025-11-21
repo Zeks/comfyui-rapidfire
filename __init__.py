@@ -8,6 +8,7 @@ from .cached_checkpoint import CachedCheckpoint
 from .escapedfind import BracketEscaper
 from .girlselector import RandomCharacterSelector
 from .schedulerselector import *
+from .rapidstringiterator import RapidStringIterator
 from .advancedksampler import *
 from .multimodelcheckpointiterator import *
 from .multimodelcheckpointiteratorfirst import MultiModelCheckpointIteratorFirst
@@ -19,6 +20,7 @@ from .danbooru import Ranbooru
 NODE_CLASS_MAPPINGS = {
     "CsvWriterNode": CsvWriterNode,
     "StringHasher": StringHasher,
+    "RapidStringIterator": RapidStringIterator,
     "ImmatureImageDataLoader": ImmatureImageDataLoader,
     "ImmatureImageCounter": ImmatureImageCounter,
     "CachedCheckpoint": CachedCheckpoint,
@@ -38,6 +40,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "CsvWriterNode": "CSV Writer",
     "StringHasher": "StringHasher",
+    "RapidStringIterator": "RapidStringIterator",
     "ImmatureImageDataLoader": "Immature Image Data Loader",
     "ImmatureImageCounter": "Immature Image Counter",
     "CachedCheckpoint": "Cached Checkpoint",
