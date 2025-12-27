@@ -1,0 +1,14 @@
+[project]
+name = "rapidfire"
+description = "A set of nodes for rapidfiring the half backed latents, cleaning up obvious bad generations and automatically queueing the rest to fully generate."
+version = "1.0.0"
+license = {file = "LICENSE"}
+
+[project.urls]
+Repository = "https://github.com/Zeks/comfyui-rapidfire"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "comfyui-rapidfire"
+Icon = ""
